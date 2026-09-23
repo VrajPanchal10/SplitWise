@@ -1,0 +1,23 @@
+spring.application.name=splitwise-backend
+
+# Server
+server.port=8080
+
+# MongoDB
+spring.data.mongodb.uri=mongodb+srv://YOUR_USERNAME:YOUR_PASSWORD@YOUR_CLUSTER_URL/splitwise_db?retryWrites=true&w=majority
+spring.data.mongodb.database=splitwise_db
+
+# JWT
+jwt.secret=REPLACE_WITH_A_LONG_RANDOM_SECRET_KEY_FOR_JWT_SIGNING_AT_LEAST_32_CHARS
+jwt.expiration=86400000
+
+# Logging
+logging.level.org.springframework.data.mongodb=DEBUG
+logging.level.org.springframework.security=DEBUG
+
+# Multipart file upload
+spring.servlet.multipart.max-file-size=10MB
+spring.servlet.multipart.max-request-size=10MB
+
+# Tesseract OCR (optional - leave empty if tessdata is in default location)
+tesseract.datapath=
