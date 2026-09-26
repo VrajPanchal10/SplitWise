@@ -40,6 +40,7 @@ public class BillService {
                 .map(this::mapToBillItem)
                 .collect(Collectors.toList());
         bill.setItems(items);
+        bill.setReceiptUrl(request.getReceiptUrl());
 
         if (request.getTotalAmount() != null) {
             bill.setTotalAmount(request.getTotalAmount());
@@ -167,6 +168,10 @@ public class BillService {
                     .mapToDouble(item -> item.getPrice() != null ? item.getPrice() : 0.0)
                     .sum();
             bill.setTotalAmount(total);
+        }
+
+        if (request.getReceiptUrl() != null) {
+            bill.setReceiptUrl(request.getReceiptUrl());
         }
 
         return billRepository.save(bill);

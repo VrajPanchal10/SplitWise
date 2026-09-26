@@ -24,7 +24,7 @@ interface Settlement {
 
 export default function SplitSummaryScreen() {
   const router = useRouter();
-  const { scannedItems, groupId, resetBill } = useBillCreation();
+  const { scannedItems, groupId, receiptUrl, resetBill } = useBillCreation();
   const { user } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
   const [friendShares, setFriendShares] = useState<FriendShare[]>([]);
@@ -138,6 +138,7 @@ export default function SplitSummaryScreen() {
         paidBy: user.id,
         participantIds: undefined,
         items: billItems,
+        receiptUrl: receiptUrl || null,
       });
 
       // Reset bill creation state

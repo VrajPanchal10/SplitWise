@@ -11,4 +11,5 @@ public class CreateBillRequest {
     private String groupId;
     private String paidBy;
     private List<BillItemRequest> items;
+    private String receiptUrl;
 }

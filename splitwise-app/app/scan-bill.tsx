@@ -10,7 +10,7 @@ import apiClient from '../services/apiClient';
 export default function ScanBillScreen() {
   const router = useRouter();
   const params = useLocalSearchParams();
-  const { setGroupId, setScannedItems, groupId } = useBillCreation();
+  const { setGroupId, setScannedItems, setReceiptUrl, groupId } = useBillCreation();
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
 
@@ -123,18 +123,28 @@ export default function ScanBillScreen() {
       // Store items in context
       setScannedItems(billItems);
 
+      // Extract receipt URL uploaded to Cloudinary
+      const receiptUrl = response.data.receiptUrl || null;
+      if (receiptUrl) {
+        setReceiptUrl(receiptUrl);
+      }
+
       console.log('[DEBUG] OCR result:', {
         confidence,
         suggestedTitle: extractedTitle,
         totalAmount: finalTotal,
         itemCount: billItems.length,
+        receiptUrl,
       });
 
-      // Navigate to manual-entry with extracted title and amount
+      // Navigate to manual-entry with extracted title, amount, and receiptUrl
       const navParams: any = {
         scannedTitle: extractedTitle,
         scannedAmount: String(finalTotal),
       };
+      if (receiptUrl) {
+        navParams.receiptUrl = receiptUrl;
+      }
       if (groupId) {
         navParams.groupId = groupId;
       }

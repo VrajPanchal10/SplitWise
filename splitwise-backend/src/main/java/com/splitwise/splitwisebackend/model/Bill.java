@@ -21,5 +21,6 @@ public class Bill {
     private String groupId;
     private String paidBy;
     private List<BillItem> items;
+    private String receiptUrl;
     private LocalDateTime createdAt;
 }

@@ -20,6 +20,7 @@ interface Bill {
   groupId: string | null;
   paidBy: string;
   items: BillItem[];
+  receiptUrl?: string;
   createdAt: string;
 }
 
@@ -295,6 +296,20 @@ export default function BillDetailScreen() {
                   {index < bill.items.length - 1 && <View style={styles.itemDivider} />}
                 </View>
               ))}
+            </View>
+          </View>
+        )}
+
+        {/* Receipt Image */}
+        {bill.receiptUrl && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Receipt</Text>
+            <View style={styles.receiptCard}>
+              <Image
+                source={{ uri: bill.receiptUrl }}
+                style={styles.receiptImage}
+                resizeMode="contain"
+              />
             </View>
           </View>
         )}
@@ -580,5 +595,18 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: theme.colors.textSecondary,
     fontFamily: theme.fontFamily.regular,
+  },
+  receiptCard: {
+    backgroundColor: theme.colors.surface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 14,
+    padding: 12,
+    alignItems: 'center',
+  },
+  receiptImage: {
+    width: '100%',
+    height: 300,
+    borderRadius: 10,
   },
 });

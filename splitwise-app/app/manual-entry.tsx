@@ -21,6 +21,7 @@ export default function ManualEntryScreen() {
   const billId = params.billId as string | undefined;
   const scannedTitle = params.scannedTitle as string | undefined;
   const scannedAmount = params.scannedAmount as string | undefined;
+  const receiptUrl = params.receiptUrl as string | undefined;
   const { user } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
   const [title, setTitle] = useState(scannedTitle || '');
@@ -189,6 +190,10 @@ export default function ManualEntryScreen() {
           }
         ],
       };
+
+      if (receiptUrl) {
+        billData.receiptUrl = receiptUrl;
+      }
 
       if (groupId) {
         billData.groupId = groupId;
