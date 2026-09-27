@@ -81,7 +81,7 @@ export default function ScanBillScreen() {
       // FormData and sets the correct multipart/form-data with boundary.
       // Manually setting it strips the boundary and breaks backend parsing.
       const response = await apiClient.post('/ocr/scan', formData, {
-        timeout: 30000,
+        timeout: 120000,
       });
 
       // The backend now returns a structured parse result with a suggested
