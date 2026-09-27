@@ -19,9 +19,12 @@ FROM eclipse-temurin:21-jre-alpine
 
 WORKDIR /app
 
+# Install native OCR engine and its image-processing dependency
+RUN apk add --no-cache tesseract-ocr leptonica
+
 COPY --from=build /app/target/splitwise-backend-0.0.1-SNAPSHOT.jar app.jar
 COPY --from=build /app/tessdata ./tessdata
 
 EXPOSE 8080
 
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-Djna.library.path=/usr/lib:/lib", "-jar", "app.jar"]
