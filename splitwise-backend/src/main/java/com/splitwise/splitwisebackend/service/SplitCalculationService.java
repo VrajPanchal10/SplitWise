@@ -1,66 +1,207 @@
 package com.splitwise.splitwisebackend.service;
 
+import com.splitwise.splitwisebackend.dto.BillBreakdownResponse;
+import com.splitwise.splitwisebackend.dto.ParticipantShare;
 import com.splitwise.splitwisebackend.dto.Settlement;
 import com.splitwise.splitwisebackend.model.Bill;
 import com.splitwise.splitwisebackend.model.BillItem;
 import com.splitwise.splitwisebackend.model.SettlementRecord;
+import com.splitwise.splitwisebackend.model.User;
 import com.splitwise.splitwisebackend.repository.BillRepository;
 import com.splitwise.splitwisebackend.repository.SettlementRecordRepository;
-import lombok.RequiredArgsConstructor;
+import com.splitwise.splitwisebackend.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.*;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class SplitCalculationService {
 
     private final BillRepository billRepository;
     private final SettlementRecordRepository settlementRecordRepository;
+    private final UserRepository userRepository;
+
+    @Autowired
+    public SplitCalculationService(BillRepository billRepository,
+                                   SettlementRecordRepository settlementRecordRepository,
+                                   UserRepository userRepository) {
+        this.billRepository = billRepository;
+        this.settlementRecordRepository = settlementRecordRepository;
+        this.userRepository = userRepository;
+    }
+
+    /** Constructor for tests where UserRepository is not mocked. */
+    public SplitCalculationService(BillRepository billRepository,
+                                   SettlementRecordRepository settlementRecordRepository) {
+        this(billRepository, settlementRecordRepository, null);
+    }
 
     /**
-     * Calculates how much each user owes for a single bill.
-     * For each BillItem, the price is divided equally among all UNIQUE users
-     * listed in sharedByUserIds.
+     * Calculates how much each user owes for a single bill using deterministic
+     * integer-cents allocation.
      *
-     * IMPORTANT: sharedByUserIds is de-duplicated before dividing. If the same
-     * user appears twice (e.g. the payer was pre-selected as a group member AND
-     * added explicitly), the price must still be divided by the number of
-     * UNIQUE people, not by the raw list size.
+     * Mathematical Correctness Guarantees:
+     * 1. Equal Split: Total amount in cents is divided by N unique participants.
+     *    Quotient = totalCents / N, Remainder = totalCents % N.
+     *    The first `remainder` participants receive (quotient + 1) cents,
+     *    and the remaining participants receive quotient cents.
+     *    The sum of shares is mathematically guaranteed to equal the item price exactly:
+     *    remainder * (quotient + 1) + (N - remainder) * quotient = N * quotient + remainder = totalCents.
+     *    No money is created or lost due to rounding.
      *
-     * Example: item price 200, sharedByUserIds = [Harsh, Kiran, Harsh]
-     * (2 people, 3 entries). Each person's share must be 100.0, NOT 66.67.
-     * Without de-duplication the incorrect 200 / 3 = 66.67 would be used.
+     * 2. Remainder Assignment Strategy:
+     *    Participants are ordered deterministically. If the bill's payer is among
+     *    the item's participants, the payer is placed first to absorb the first remainder
+     *    cent, followed by the rest in stable order.
+     *
+     * 3. Custom / Unequal Split:
+     *    If an item specifies `customShares` (a map of userId -> exact share amount),
+     *    those exact amounts are used (validated to non-negative and matching item price).
+     *
+     * 4. De-duplication:
+     *    `sharedByUserIds` is de-duplicated using LinkedHashSet so duplicate entries
+     *    never inflate the participant count.
+     *
+     * 5. Zero / Empty Participants:
+     *    Items with null/empty `sharedByUserIds` are safely skipped.
      *
      * @param bill the bill to calculate shares for
-     * @return a map of userId -> total amount that user owes
+     * @return a map of userId -> total rounded amount (in rupees) that user owes
      */
     public Map<String, Double> calculateIndividualShares(Bill bill) {
-        Map<String, Double> shares = new HashMap<>();
+        Map<String, Double> shares = new LinkedHashMap<>();
+        if (bill == null || bill.getItems() == null) {
+            return shares;
+        }
+
+        String payerId = bill.getPaidBy();
 
         for (BillItem item : bill.getItems()) {
+            if (item == null || item.getPrice() == null) {
+                continue;
+            }
+
+            // Case 1: Custom / Unequal split per item
+            if (item.getCustomShares() != null && !item.getCustomShares().isEmpty()) {
+                for (Map.Entry<String, Double> entry : item.getCustomShares().entrySet()) {
+                    String userId = entry.getKey();
+                    Double customAmount = entry.getValue();
+                    if (userId != null && customAmount != null) {
+                        double roundedAmount = Math.round(customAmount * 100.0) / 100.0;
+                        shares.put(userId, roundToTwoDecimals(shares.getOrDefault(userId, 0.0) + roundedAmount));
+                    }
+                }
+                continue;
+            }
+
+            // Case 2: Equal split among unique participants
             List<String> sharedBy = item.getSharedByUserIds();
             if (sharedBy == null || sharedBy.isEmpty()) {
                 continue;
             }
 
-            // De-duplicate — duplicates must NOT inflate the split count.
-            Set<String> uniqueSharedBy = new LinkedHashSet<>(sharedBy);
-            if (uniqueSharedBy.isEmpty()) {
+            // De-duplicate participants while maintaining deterministic order
+            Set<String> uniqueSet = new LinkedHashSet<>(sharedBy);
+            if (uniqueSet.isEmpty()) {
                 continue;
             }
 
-            double sharePerUser = item.getPrice() / uniqueSharedBy.size();
+            // Deterministic ordering: if payer is in the participant list, place payer first
+            List<String> orderedParticipants = new ArrayList<>();
+            if (payerId != null && uniqueSet.contains(payerId)) {
+                orderedParticipants.add(payerId);
+            }
+            for (String uid : uniqueSet) {
+                if (!uid.equals(payerId)) {
+                    orderedParticipants.add(uid);
+                }
+            }
 
-            for (String userId : uniqueSharedBy) {
-                shares.put(userId, shares.getOrDefault(userId, 0.0) + sharePerUser);
+            int participantCount = orderedParticipants.size();
+            long totalCents = Math.round(item.getPrice() * 100.0);
+            long baseCents = totalCents / participantCount;
+            long remainderCents = totalCents % participantCount;
+
+            for (int i = 0; i < participantCount; i++) {
+                String userId = orderedParticipants.get(i);
+                long cents = baseCents + (i < remainderCents ? 1 : 0);
+                double userShare = cents / 100.0;
+                shares.put(userId, roundToTwoDecimals(shares.getOrDefault(userId, 0.0) + userShare));
             }
         }
 
         return shares;
+    }
+
+    /**
+     * Produces a comprehensive breakdown for an expense showing:
+     * - Total bill amount
+     * - Who paid (and how much they paid)
+     * - Participant count
+     * - For each participant: paid amount, share amount, and net balance (+/-)
+     */
+    public BillBreakdownResponse calculateBillBreakdown(Bill bill) {
+        if (bill == null) {
+            return null;
+        }
+
+        Map<String, Double> shares = calculateIndividualShares(bill);
+        String payerId = bill.getPaidBy();
+        double totalAmount = bill.getTotalAmount() != null ? roundToTwoDecimals(bill.getTotalAmount()) : 0.0;
+
+        // Collect all distinct participants (everyone who owes a share + payer)
+        Set<String> allParticipantIds = new LinkedHashSet<>();
+        if (payerId != null) {
+            allParticipantIds.add(payerId);
+        }
+        allParticipantIds.addAll(shares.keySet());
+
+        String paidByName = "Unknown";
+        if (payerId != null && userRepository != null) {
+            paidByName = userRepository.findById(payerId)
+                    .map(User::getFullName)
+                    .orElse(payerId);
+        }
+
+        List<ParticipantShare> participantShares = new ArrayList<>();
+        for (String userId : allParticipantIds) {
+            String name = userId;
+            if (userRepository != null) {
+                name = userRepository.findById(userId)
+                        .map(User::getFullName)
+                        .orElse(userId);
+            }
+
+            double paid = userId.equals(payerId) ? totalAmount : 0.0;
+            double share = shares.getOrDefault(userId, 0.0);
+            double net = roundToTwoDecimals(paid - share);
+
+            participantShares.add(ParticipantShare.builder()
+                    .userId(userId)
+                    .name(name)
+                    .paidAmount(paid)
+                    .shareAmount(share)
+                    .netAmount(net)
+                    .build());
+        }
+
+        return BillBreakdownResponse.builder()
+                .billId(bill.getId())
+                .title(bill.getTitle())
+                .totalAmount(totalAmount)
+                .paidBy(payerId)
+                .paidByName(paidByName)
+                .participantCount(allParticipantIds.size())
+                .participants(participantShares)
+                .build();
+    }
+
+    private static double roundToTwoDecimals(double value) {
+        return Math.round(value * 100.0) / 100.0;
     }
 
     /**

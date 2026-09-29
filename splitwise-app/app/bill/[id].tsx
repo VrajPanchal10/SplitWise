@@ -6,6 +6,7 @@ import { ZigzagEdge } from '@/components/ZigzagEdge';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../../context/AuthContext';
 import apiClient from '../../services/apiClient';
+import { calculateBillBreakdown } from '../../utils/splitCalculator';
 
 interface BillItem {
   name: string;
@@ -27,7 +28,9 @@ interface Bill {
 interface ShareBreakdown {
   userId: string;
   name: string;
-  share: number;
+  paidAmount: number;
+  shareAmount: number;
+  netAmount: number;
   profilePictureUrl?: string;
 }
 
@@ -44,26 +47,7 @@ const getCategoryConfig = (category: string) => {
   }
 };
 
-/**
- * Calculates a user's share of a bill by summing each item's price divided
- * by the number of UNIQUE participants in that item's sharedByUserIds.
- */
-const calculateUserShare = (bill: Bill, userId: string): number => {
-  if (!bill.items || bill.items.length === 0) return 0;
-
-  let totalShare = 0;
-  for (const item of bill.items) {
-    if (!item.sharedByUserIds || item.sharedByUserIds.length === 0) continue;
-
-    const uniqueSharedBy = Array.from(new Set(item.sharedByUserIds));
-    if (uniqueSharedBy.length === 0) continue;
-
-    if (uniqueSharedBy.includes(userId)) {
-      totalShare += item.price / uniqueSharedBy.length;
-    }
-  }
-  return totalShare;
-};
+// calculateUserShare is now handled by the deterministic splitCalculator utility
 
 export default function BillDetailScreen() {
   const router = useRouter();
@@ -96,39 +80,52 @@ export default function BillDetailScreen() {
         console.error('Error fetching payer name:', error);
       }
 
-      // 3. Build per-person share breakdown
-      // Collect all unique participant IDs from all items
+      // 3. Build per-person share breakdown using deterministic calculator
       const participantIds = new Set<string>();
       billData.items?.forEach((item) => {
         item.sharedByUserIds?.forEach((id) => participantIds.add(id));
       });
 
-      // Calculate each participant's share
-      const shareMap = new Map<string, number>();
-      participantIds.forEach((participantId) => {
-        shareMap.set(participantId, calculateUserShare(billData, participantId));
-      });
+      const itemsForCalc = (billData.items || []).map(item => ({
+        name: item.name,
+        price: item.price,
+        sharedByUserIds: item.sharedByUserIds,
+      }));
+
+      const calcResult = calculateBillBreakdown(
+        billData.totalAmount,
+        billData.paidBy,
+        Array.from(participantIds),
+        itemsForCalc
+      );
 
       // Fetch names and profile pictures for all participants
       const breakdown: ShareBreakdown[] = [];
-      for (const [participantId, share] of shareMap.entries()) {
-        let name = participantId;
+      for (const p of calcResult.participants) {
+        let name = p.userId;
         let profilePictureUrl: string | undefined;
         try {
-          const userResponse = await apiClient.get(`/users/${participantId}`);
-          name = userResponse.data.fullName || participantId;
+          const userResponse = await apiClient.get(`/users/${p.userId}`);
+          name = userResponse.data.fullName || p.userId;
           profilePictureUrl = userResponse.data.profilePictureUrl;
         } catch (error) {
-          console.error(`Error fetching user ${participantId}:`, error);
+          console.error(`Error fetching user ${p.userId}:`, error);
         }
-        breakdown.push({ userId: participantId, name, share, profilePictureUrl });
+        breakdown.push({
+          userId: p.userId,
+          name,
+          paidAmount: p.paidAmount,
+          shareAmount: p.shareAmount,
+          netAmount: p.netAmount,
+          profilePictureUrl,
+        });
       }
 
       // Sort: current user first, then by share descending
       breakdown.sort((a, b) => {
         if (a.userId === user?.id) return -1;
         if (b.userId === user?.id) return 1;
-        return b.share - a.share;
+        return b.shareAmount - a.shareAmount;
       });
 
       setShares(breakdown);
@@ -241,13 +238,13 @@ export default function BillDetailScreen() {
       <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
         {/* Per-Person Breakdown */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Who owes what</Text>
+          <Text style={styles.sectionTitle}>Expense Breakdown</Text>
           <View style={styles.breakdownCard}>
             {shares.map((share, index) => (
               <View key={share.userId}>
                 <View style={styles.shareRow}>
                   <View style={styles.sharePerson}>
-                  <View style={[styles.shareAvatar, { backgroundColor: share.userId === user?.id ? theme.colors.primary : theme.colors.success }]}>
+                    <View style={[styles.shareAvatar, { backgroundColor: share.userId === user?.id ? theme.colors.primary : theme.colors.success }]}>
                       {share.profilePictureUrl ? (
                         <Image
                           key={share.profilePictureUrl}
@@ -264,12 +261,33 @@ export default function BillDetailScreen() {
                       <Text style={styles.shareName}>
                         {share.userId === user?.id ? 'You' : share.name}
                       </Text>
-                      {share.userId === bill.paidBy && (
-                        <Text style={styles.sharePaidLabel}>Paid</Text>
-                      )}
+                      <Text style={styles.sharePaidLabel}>
+                        Paid: ₹{share.paidAmount.toFixed(2)}
+                      </Text>
                     </View>
                   </View>
-                  <Text style={styles.shareAmount}>₹{share.share.toFixed(2)}</Text>
+                  <View style={styles.shareAmountColumn}>
+                    <Text style={styles.shareAmount}>₹{share.shareAmount.toFixed(2)}</Text>
+                    <View style={[
+                      styles.netBadge,
+                      share.netAmount > 0 ? styles.netBadgePositive
+                        : share.netAmount < 0 ? styles.netBadgeNegative
+                        : styles.netBadgeZero
+                    ]}>
+                      <Text style={[
+                        styles.netBadgeText,
+                        share.netAmount > 0 ? styles.netTextPositive
+                          : share.netAmount < 0 ? styles.netTextNegative
+                          : styles.netTextZero
+                      ]}>
+                        {share.netAmount > 0
+                          ? `gets back ₹${share.netAmount.toFixed(2)}`
+                          : share.netAmount < 0
+                          ? `owes ₹${Math.abs(share.netAmount).toFixed(2)}`
+                          : 'settled'}
+                      </Text>
+                    </View>
+                  </View>
                 </View>
                 {index < shares.length - 1 && <View style={styles.shareDivider} />}
               </View>
@@ -499,11 +517,43 @@ const styles = StyleSheet.create({
     color: theme.colors.success,
     fontFamily: theme.fontFamily.regular,
   },
+  shareAmountColumn: {
+    alignItems: 'flex-end',
+    gap: 4,
+  },
   shareAmount: {
     fontSize: 14,
     fontWeight: '600',
     color: theme.colors.textPrimary,
     fontFamily: theme.fontFamily.mono,
+  },
+  netBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  netBadgePositive: {
+    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+  },
+  netBadgeNegative: {
+    backgroundColor: 'rgba(239, 68, 68, 0.10)',
+  },
+  netBadgeZero: {
+    backgroundColor: 'rgba(148, 163, 184, 0.10)',
+  },
+  netBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+    fontFamily: theme.fontFamily.regular,
+  },
+  netTextPositive: {
+    color: theme.colors.success,
+  },
+  netTextNegative: {
+    color: theme.colors.danger,
+  },
+  netTextZero: {
+    color: theme.colors.textSecondary,
   },
   itemsCard: {
     backgroundColor: theme.colors.surface,

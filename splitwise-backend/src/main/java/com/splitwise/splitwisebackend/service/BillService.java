@@ -30,8 +30,10 @@ public class BillService {
     private final ActivityService activityService;
 
     public Bill createBill(CreateBillRequest request) {
+        validateBillRequest(request);
+
         Bill bill = new Bill();
-        bill.setTitle(request.getTitle());
+        bill.setTitle(request.getTitle().trim());
         bill.setGroupId(request.getGroupId());
         bill.setPaidBy(request.getPaidBy());
         bill.setCreatedAt(LocalDateTime.now());
@@ -43,12 +45,12 @@ public class BillService {
         bill.setReceiptUrl(request.getReceiptUrl());
 
         if (request.getTotalAmount() != null) {
-            bill.setTotalAmount(request.getTotalAmount());
+            bill.setTotalAmount(Math.round(request.getTotalAmount() * 100.0) / 100.0);
         } else {
             double total = items.stream()
                     .mapToDouble(item -> item.getPrice() != null ? item.getPrice() : 0.0)
                     .sum();
-            bill.setTotalAmount(total);
+            bill.setTotalAmount(Math.round(total * 100.0) / 100.0);
         }
 
         Bill saved = billRepository.save(bill);
@@ -126,10 +128,79 @@ public class BillService {
 
     private BillItem mapToBillItem(BillItemRequest request) {
         BillItem item = new BillItem();
-        item.setName(request.getName());
-        item.setPrice(request.getPrice());
-        item.setSharedByUserIds(request.getSharedByUserIds());
+        item.setName(request.getName() != null ? request.getName().trim() : "Item");
+        item.setPrice(request.getPrice() != null ? Math.round(request.getPrice() * 100.0) / 100.0 : 0.0);
+        // De-duplicate participant IDs while preserving stable order
+        if (request.getSharedByUserIds() != null) {
+            item.setSharedByUserIds(new java.util.ArrayList<>(new java.util.LinkedHashSet<>(request.getSharedByUserIds())));
+        }
+        item.setCustomShares(request.getCustomShares());
         return item;
+    }
+
+    private void validateBillRequest(CreateBillRequest request) {
+        if (request == null) {
+            throw new ApiException("Bill request cannot be null", HttpStatus.BAD_REQUEST);
+        }
+        if (request.getTitle() == null || request.getTitle().trim().isEmpty()) {
+            throw new ApiException("Bill title is required", HttpStatus.BAD_REQUEST);
+        }
+        if (request.getPaidBy() == null || request.getPaidBy().trim().isEmpty()) {
+            throw new ApiException("Payer ID is required", HttpStatus.BAD_REQUEST);
+        }
+        if (request.getTotalAmount() != null && request.getTotalAmount() <= 0) {
+            throw new ApiException("Total amount must be greater than zero", HttpStatus.BAD_REQUEST);
+        }
+        if (request.getItems() == null || request.getItems().isEmpty()) {
+            throw new ApiException("At least one bill item is required", HttpStatus.BAD_REQUEST);
+        }
+
+        java.util.Set<String> allParticipants = new java.util.HashSet<>();
+        double itemsSum = 0.0;
+
+        for (BillItemRequest item : request.getItems()) {
+            if (item.getPrice() != null) {
+                if (item.getPrice() < 0) {
+                    throw new ApiException("Item price cannot be negative", HttpStatus.BAD_REQUEST);
+                }
+                itemsSum += item.getPrice();
+            }
+
+            List<String> sharedBy = item.getSharedByUserIds();
+            if (sharedBy == null || sharedBy.isEmpty()) {
+                throw new ApiException("Every item must have at least one participant", HttpStatus.BAD_REQUEST);
+            }
+            allParticipants.addAll(sharedBy);
+
+            // Custom shares validation
+            if (item.getCustomShares() != null && !item.getCustomShares().isEmpty()) {
+                double customSum = 0.0;
+                for (java.util.Map.Entry<String, Double> entry : item.getCustomShares().entrySet()) {
+                    if (entry.getValue() == null || entry.getValue() < 0) {
+                        throw new ApiException("Custom share amount cannot be negative", HttpStatus.BAD_REQUEST);
+                    }
+                    customSum += entry.getValue();
+                }
+                if (item.getPrice() != null && Math.abs(customSum - item.getPrice()) > 0.05) {
+                    throw new ApiException("Custom shares for '" + item.getName() + "' (₹" +
+                            String.format("%.2f", customSum) + ") must sum to item price (₹" +
+                            String.format("%.2f", item.getPrice()) + ")", HttpStatus.BAD_REQUEST);
+                }
+            }
+        }
+
+        if (allParticipants.isEmpty()) {
+            throw new ApiException("At least one participant must be selected", HttpStatus.BAD_REQUEST);
+        }
+
+        // Reconcile itemsSum with totalAmount if multiple items are provided
+        if (request.getTotalAmount() != null && request.getItems().size() > 1) {
+            if (Math.abs(itemsSum - request.getTotalAmount()) > 0.05) {
+                throw new ApiException("Sum of item prices (₹" + String.format("%.2f", itemsSum) +
+                        ") does not match bill total (₹" + String.format("%.2f", request.getTotalAmount()) + ")",
+                        HttpStatus.BAD_REQUEST);
+            }
+        }
     }
 
     public List<Bill> getBillsByGroup(String groupId) {
@@ -144,10 +215,11 @@ public class BillService {
     }
 
     public Bill updateBill(String billId, CreateBillRequest request) {
+        validateBillRequest(request);
         Bill bill = getBillById(billId);
 
         if (request.getTitle() != null) {
-            bill.setTitle(request.getTitle());
+            bill.setTitle(request.getTitle().trim());
         }
         if (request.getGroupId() != null) {
             bill.setGroupId(request.getGroupId());
@@ -162,12 +234,12 @@ public class BillService {
             bill.setItems(items);
         }
         if (request.getTotalAmount() != null) {
-            bill.setTotalAmount(request.getTotalAmount());
+            bill.setTotalAmount(Math.round(request.getTotalAmount() * 100.0) / 100.0);
         } else if (request.getItems() != null) {
             double total = bill.getItems().stream()
                     .mapToDouble(item -> item.getPrice() != null ? item.getPrice() : 0.0)
                     .sum();
-            bill.setTotalAmount(total);
+            bill.setTotalAmount(Math.round(total * 100.0) / 100.0);
         }
 
         if (request.getReceiptUrl() != null) {

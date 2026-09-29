@@ -1,5 +1,6 @@
 package com.splitwise.splitwisebackend.controller;
 
+import com.splitwise.splitwisebackend.dto.BillBreakdownResponse;
 import com.splitwise.splitwisebackend.dto.CreateBillRequest;
 import com.splitwise.splitwisebackend.dto.Settlement;
 import com.splitwise.splitwisebackend.model.Bill;
@@ -57,6 +58,13 @@ public class BillController {
     public ResponseEntity<Bill> getBill(@PathVariable String id) {
         Bill bill = billService.getBillById(id);
         return ResponseEntity.ok(bill);
+    }
+
+    @GetMapping("/{id}/breakdown")
+    public ResponseEntity<BillBreakdownResponse> getBillBreakdown(@PathVariable String id) {
+        Bill bill = billService.getBillById(id);
+        BillBreakdownResponse breakdown = splitCalculationService.calculateBillBreakdown(bill);
+        return ResponseEntity.ok(breakdown);
     }
 
     @PutMapping("/{id}")

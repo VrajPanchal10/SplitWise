@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, TextInput, ScrollView, ActivityIndicator, Alert, Image } from 'react-native';
 import { ChevronLeft, Check, ChevronDown, ChevronUp, AlertTriangle, Edit3 } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
@@ -6,6 +6,11 @@ import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../context/AuthContext';
 import { useBillCreation } from '../context/BillCreationContext';
 import apiClient from '../services/apiClient';
+import {
+  splitEquallyDeterministically,
+  calculateBillBreakdown,
+  validateCustomShares,
+} from '../utils/splitCalculator';
 
 interface Friend {
   id: string;
@@ -47,6 +52,11 @@ export default function ManualEntryScreen() {
   const [titleError, setTitleError] = useState('');
   const [amountError, setAmountError] = useState('');
   const [participantError, setParticipantError] = useState('');
+
+  // Split mode: equal vs unequal/custom
+  const [splitMode, setSplitMode] = useState<'equal' | 'unequal'>('equal');
+  const [customShares, setCustomShares] = useState<{ [userId: string]: string }>({});
+  const [customShareError, setCustomShareError] = useState('');
 
   // OCR items for review/edit
   const [ocrItems, setOcrItems] = useState<OcrItem[]>([]);
@@ -249,11 +259,82 @@ export default function ManualEntryScreen() {
     setAmount(String(Math.round(sum * 100) / 100));
   };
 
+  // Active participants list (payer/current user + selected friends)
+  const activeParticipantIds = useMemo(() => {
+    return Array.from(new Set([user?.id, ...selectedFriendIds].filter(Boolean) as string[]));
+  }, [user?.id, selectedFriendIds]);
+
+  const getParticipantName = (uid: string) => {
+    if (uid === user?.id) return 'You';
+    const found = friends.find(f => f.id === uid);
+    return found ? found.fullName : `User ${uid.slice(0, 4)}`;
+  };
+
+  const getParticipantAvatar = (uid: string) => {
+    if (uid === user?.id) return user.profilePictureUrl;
+    const found = friends.find(f => f.id === uid);
+    return found ? found.profilePictureUrl : undefined;
+  };
+
+  const handleSplitModeChange = (mode: 'equal' | 'unequal') => {
+    setSplitMode(mode);
+    setCustomShareError('');
+    if (mode === 'unequal' && activeParticipantIds.length > 0) {
+      const total = parseFloat(amount) || 0;
+      const initial = splitEquallyDeterministically(total, activeParticipantIds, user?.id);
+      const newShares: { [userId: string]: string } = {};
+      for (const uid of activeParticipantIds) {
+        newShares[uid] = initial[uid] !== undefined ? initial[uid].toFixed(2) : '0.00';
+      }
+      setCustomShares(newShares);
+    }
+  };
+
+  const handleCustomShareChange = (uid: string, text: string) => {
+    setCustomShares(prev => ({
+      ...prev,
+      [uid]: text,
+    }));
+    setCustomShareError('');
+  };
+
+  // Custom share validation
+  const customValidation = useMemo(() => {
+    if (splitMode !== 'unequal') {
+      return { isValid: true, sum: 0, difference: 0 };
+    }
+    const total = parseFloat(amount) || 0;
+    const numericShares: Record<string, number> = {};
+    for (const uid of activeParticipantIds) {
+      numericShares[uid] = parseFloat(customShares[uid] || '0') || 0;
+    }
+    return validateCustomShares(numericShares, total);
+  }, [splitMode, amount, activeParticipantIds, customShares]);
+
+  // Live breakdown computation for UI preview
+  const liveBreakdown = useMemo(() => {
+    const total = parseFloat(amount);
+    if (!amount || isNaN(total) || total <= 0 || !user || activeParticipantIds.length === 0) {
+      return null;
+    }
+
+    if (splitMode === 'unequal') {
+      const numericShares: Record<string, number> = {};
+      for (const uid of activeParticipantIds) {
+        numericShares[uid] = parseFloat(customShares[uid] || '0') || 0;
+      }
+      return calculateBillBreakdown(total, user.id, activeParticipantIds, undefined, numericShares);
+    } else {
+      return calculateBillBreakdown(total, user.id, activeParticipantIds);
+    }
+  }, [amount, activeParticipantIds, user, splitMode, customShares]);
+
   const handleSave = async () => {
     // Clear previous errors
     setTitleError('');
     setAmountError('');
     setParticipantError('');
+    setCustomShareError('');
 
     // Validation
     let hasError = false;
@@ -269,10 +350,19 @@ export default function ManualEntryScreen() {
       hasError = true;
     }
 
-    const sharedByUserIds = Array.from(new Set([user?.id, ...selectedFriendIds].filter(Boolean)));
+    const sharedByUserIds = activeParticipantIds;
     if (sharedByUserIds.length === 0) {
       setParticipantError('At least one participant must be selected');
       hasError = true;
+    }
+
+    if (splitMode === 'unequal') {
+      if (!customValidation.isValid) {
+        const msg = customValidation.message || 'Custom shares must equal the total bill amount';
+        setCustomShareError(msg);
+        Alert.alert('Invalid Custom Split', msg);
+        hasError = true;
+      }
     }
 
     if (hasError || !user) return;
@@ -280,9 +370,22 @@ export default function ManualEntryScreen() {
     setIsLoading(true);
 
     try {
-      // Build items list: use OCR items if available, otherwise single item
+      // Build items list: use custom shares if unequal, OCR items if available, otherwise single item
       let items;
-      if (ocrItems.length > 0) {
+      if (splitMode === 'unequal') {
+        const numericCustomShares: Record<string, number> = {};
+        for (const uid of sharedByUserIds) {
+          numericCustomShares[uid] = parseFloat(customShares[uid] || '0') || 0;
+        }
+        items = [
+          {
+            name: title.trim(),
+            price: totalAmount,
+            sharedByUserIds,
+            customShares: numericCustomShares,
+          }
+        ];
+      } else if (ocrItems.length > 0) {
         items = ocrItems.map(item => ({
           name: item.name,
           price: item.price,
@@ -713,6 +816,199 @@ export default function ManualEntryScreen() {
                 </View>
               )}
             </View>
+          </View>
+        )}
+
+        {/* Split Method & Live Breakdown Section */}
+        {activeParticipantIds.length > 0 && parseFloat(amount) > 0 && (
+          <View style={styles.splitConfigSection}>
+            <Text style={styles.sectionTitle}>Split Method</Text>
+            <View style={styles.splitModeSelector}>
+              <TouchableOpacity
+                style={[
+                  styles.splitModeBtn,
+                  splitMode === 'equal' && styles.splitModeBtnActive,
+                ]}
+                onPress={() => handleSplitModeChange('equal')}>
+                <Text
+                  style={[
+                    styles.splitModeBtnText,
+                    splitMode === 'equal' && styles.splitModeBtnTextActive,
+                  ]}>
+                  Equal Split
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.splitModeBtn,
+                  splitMode === 'unequal' && styles.splitModeBtnActive,
+                ]}
+                onPress={() => handleSplitModeChange('unequal')}>
+                <Text
+                  style={[
+                    styles.splitModeBtnText,
+                    splitMode === 'unequal' && styles.splitModeBtnTextActive,
+                  ]}>
+                  Unequal / Custom
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Custom share inputs when splitMode is unequal */}
+            {splitMode === 'unequal' && (
+              <View style={styles.customSharesContainer}>
+                <Text style={styles.customSharesHeader}>Enter individual shares:</Text>
+                {activeParticipantIds.map((uid) => (
+                  <View key={uid} style={styles.customShareRow}>
+                    <View style={styles.customShareParticipant}>
+                      <View style={styles.customShareAvatar}>
+                        <Text style={styles.customShareAvatarText}>
+                          {getParticipantName(uid).charAt(0)}
+                        </Text>
+                      </View>
+                      <Text style={styles.customShareName}>
+                        {uid === user?.id ? 'You' : getParticipantName(uid)}
+                      </Text>
+                    </View>
+                    <View style={styles.customShareInputWrap}>
+                      <Text style={styles.currencySymbolSmall}>₹</Text>
+                      <TextInput
+                        style={styles.customShareInput}
+                        value={customShares[uid] || ''}
+                        onChangeText={(t) => handleCustomShareChange(uid, t)}
+                        placeholder="0.00"
+                        placeholderTextColor={theme.colors.textSecondary}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                  </View>
+                ))}
+
+                {/* Validation Status Badge */}
+                <View
+                  style={[
+                    styles.validationBadge,
+                    customValidation.isValid
+                      ? styles.validationBadgeSuccess
+                      : customValidation.difference > 0
+                      ? styles.validationBadgeWarning
+                      : styles.validationBadgeDanger,
+                  ]}>
+                  <Text
+                    style={[
+                      styles.validationBadgeText,
+                      customValidation.isValid
+                        ? styles.validationTextSuccess
+                        : customValidation.difference > 0
+                        ? styles.validationTextWarning
+                        : styles.validationTextDanger,
+                    ]}>
+                    {customValidation.isValid
+                      ? `✓ Shares match bill total (₹${customValidation.sum.toFixed(2)})`
+                      : customValidation.message}
+                  </Text>
+                </View>
+                {customShareError ? (
+                  <Text style={styles.errorText}>{customShareError}</Text>
+                ) : null}
+              </View>
+            )}
+
+            {/* Live Expense Breakdown Preview */}
+            {liveBreakdown && (
+              <View style={styles.liveBreakdownCard}>
+                <View style={styles.breakdownHeaderRow}>
+                  <Text style={styles.liveBreakdownTitle}>Live Expense Breakdown</Text>
+                  <Text style={styles.liveBreakdownSubtitle}>Deterministic · 100% Reconciled</Text>
+                </View>
+
+                {/* Top Summary Bar */}
+                <View style={styles.breakdownSummaryBar}>
+                  <View style={styles.summaryPill}>
+                    <Text style={styles.summaryPillLabel}>Total Bill</Text>
+                    <Text style={styles.summaryPillValue}>₹{liveBreakdown.totalAmount.toFixed(2)}</Text>
+                  </View>
+                  <View style={styles.summaryPillDivider} />
+                  <View style={styles.summaryPill}>
+                    <Text style={styles.summaryPillLabel}>Paid By</Text>
+                    <Text style={styles.summaryPillValue}>You</Text>
+                  </View>
+                  <View style={styles.summaryPillDivider} />
+                  <View style={styles.summaryPill}>
+                    <Text style={styles.summaryPillLabel}>Participants</Text>
+                    <Text style={styles.summaryPillValue}>{liveBreakdown.participantCount} people</Text>
+                  </View>
+                </View>
+
+                {/* Participant breakdown items */}
+                <View style={styles.breakdownList}>
+                  {liveBreakdown.participants.map((p, idx) => {
+                    const isPayer = p.userId === liveBreakdown.paidBy;
+                    const isCurrentUser = p.userId === user?.id;
+                    const pName = isCurrentUser ? 'You' : getParticipantName(p.userId);
+                    return (
+                      <View key={p.userId}>
+                        <View style={styles.breakdownParticipantRow}>
+                          <View style={styles.breakdownParticipantLeft}>
+                            <View
+                              style={[
+                                styles.breakdownAvatar,
+                                {
+                                  backgroundColor: isCurrentUser
+                                    ? theme.colors.primary
+                                    : theme.colors.success,
+                                },
+                              ]}>
+                              <Text style={styles.breakdownAvatarText}>{pName.charAt(0)}</Text>
+                            </View>
+                            <View style={styles.breakdownNameCol}>
+                              <Text style={styles.breakdownNameText}>
+                                {pName} {isPayer ? '(Payer)' : ''}
+                              </Text>
+                              <Text style={styles.breakdownMetaText}>
+                                Paid: ₹{p.paidAmount.toFixed(2)} · Share: ₹{p.shareAmount.toFixed(2)}
+                              </Text>
+                            </View>
+                          </View>
+
+                          <View
+                            style={[
+                              styles.netAmountBadge,
+                              p.netAmount > 0
+                                ? styles.netBadgePositive
+                                : p.netAmount < 0
+                                ? styles.netBadgeNegative
+                                : styles.netBadgeZero,
+                            ]}>
+                            <Text
+                              style={[
+                                styles.netAmountText,
+                                p.netAmount > 0
+                                  ? styles.netTextPositive
+                                  : p.netAmount < 0
+                                  ? styles.netTextNegative
+                                  : styles.netTextZero,
+                              ]}>
+                              {p.netAmount > 0
+                                ? `+₹${p.netAmount.toFixed(2)}`
+                                : p.netAmount < 0
+                                ? `-₹${Math.abs(p.netAmount).toFixed(2)}`
+                                : '₹0.00'}
+                            </Text>
+                            <Text style={styles.netSubText}>
+                              {p.netAmount > 0 ? 'receives' : p.netAmount < 0 ? 'owes' : 'settled'}
+                            </Text>
+                          </View>
+                        </View>
+                        {idx < liveBreakdown.participants.length - 1 && (
+                          <View style={styles.breakdownItemDivider} />
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+              </View>
+            )}
           </View>
         )}
 
@@ -1224,5 +1520,281 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '500',
     fontFamily: theme.fontFamily.regular,
+  },
+  splitConfigSection: {
+    paddingHorizontal: theme.spacing[24],
+    marginTop: theme.spacing[16],
+    marginBottom: theme.spacing[8],
+  },
+  splitModeSelector: {
+    flexDirection: 'row',
+    backgroundColor: theme.colors.surface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: theme.spacing[16],
+    gap: 4,
+  },
+  splitModeBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderRadius: 8,
+  },
+  splitModeBtnActive: {
+    backgroundColor: theme.colors.primary,
+  },
+  splitModeBtnText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  splitModeBtnTextActive: {
+    color: theme.colors.cream,
+    fontWeight: '600',
+  },
+  customSharesContainer: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing[16],
+    marginBottom: theme.spacing[16],
+  },
+  customSharesHeader: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+    marginBottom: theme.spacing[12],
+    fontFamily: theme.fontFamily.regular,
+  },
+  customShareRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: theme.spacing[8],
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+  },
+  customShareParticipant: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.spacing[8],
+    flex: 1,
+  },
+  customShareAvatar: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: theme.colors.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  customShareAvatarText: {
+    color: theme.colors.cream,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  customShareName: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  customShareInputWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: theme.colors.background,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    width: 110,
+  },
+  currencySymbolSmall: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: theme.colors.textSecondary,
+    marginRight: 4,
+  },
+  customShareInput: {
+    flex: 1,
+    height: 36,
+    fontSize: 14,
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+    paddingVertical: 0,
+  },
+  validationBadge: {
+    marginTop: theme.spacing[12],
+    paddingVertical: theme.spacing[8],
+    paddingHorizontal: theme.spacing[12],
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  validationBadgeSuccess: {
+    backgroundColor: '#E8F5E9',
+  },
+  validationBadgeWarning: {
+    backgroundColor: '#FFF8E1',
+  },
+  validationBadgeDanger: {
+    backgroundColor: '#FFEBEE',
+  },
+  validationBadgeText: {
+    fontSize: 13,
+    fontWeight: '500',
+    fontFamily: theme.fontFamily.regular,
+  },
+  validationTextSuccess: {
+    color: '#2E7D32',
+  },
+  validationTextWarning: {
+    color: '#F57F17',
+  },
+  validationTextDanger: {
+    color: '#C62828',
+  },
+  liveBreakdownCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing[16],
+    marginBottom: theme.spacing[8],
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+  breakdownHeaderRow: {
+    marginBottom: theme.spacing[12],
+  },
+  liveBreakdownTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  liveBreakdownSubtitle: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+    marginTop: 2,
+  },
+  breakdownSummaryBar: {
+    flexDirection: 'row',
+    backgroundColor: theme.colors.background,
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    marginBottom: theme.spacing[16],
+    alignItems: 'center',
+    justifyContent: 'space-around',
+  },
+  summaryPill: {
+    alignItems: 'center',
+  },
+  summaryPillLabel: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    marginBottom: 2,
+    fontFamily: theme.fontFamily.regular,
+  },
+  summaryPillValue: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  summaryPillDivider: {
+    width: 1,
+    height: 24,
+    backgroundColor: theme.colors.border,
+  },
+  breakdownList: {
+    gap: 8,
+  },
+  breakdownParticipantRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 6,
+  },
+  breakdownParticipantLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+  },
+  breakdownAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  breakdownAvatarText: {
+    color: theme.colors.cream,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  breakdownNameCol: {
+    flex: 1,
+  },
+  breakdownNameText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  breakdownMetaText: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+    fontFamily: theme.fontFamily.regular,
+  },
+  netAmountBadge: {
+    alignItems: 'flex-end',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  netBadgePositive: {
+    backgroundColor: '#E8F5E9',
+  },
+  netBadgeNegative: {
+    backgroundColor: '#FFEBEE',
+  },
+  netBadgeZero: {
+    backgroundColor: theme.colors.background,
+  },
+  netAmountText: {
+    fontSize: 14,
+    fontWeight: '700',
+    fontFamily: theme.fontFamily.regular,
+  },
+  netTextPositive: {
+    color: '#2E7D32',
+  },
+  netTextNegative: {
+    color: '#C62828',
+  },
+  netTextZero: {
+    color: theme.colors.textSecondary,
+  },
+  netSubText: {
+    fontSize: 10,
+    color: theme.colors.textSecondary,
+    textTransform: 'uppercase',
+    fontWeight: '600',
+  },
+  breakdownItemDivider: {
+    height: 1,
+    backgroundColor: theme.colors.border,
+    marginVertical: 4,
   },
 });

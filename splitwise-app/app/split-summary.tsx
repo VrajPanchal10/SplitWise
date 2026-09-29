@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, ActivityIndicator, TextInput, Image } from 'react-native';
 import { ChevronLeft, ArrowRight } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
@@ -6,11 +6,19 @@ import { useRouter } from 'expo-router';
 import { useBillCreation } from '../context/BillCreationContext';
 import { useAuth } from '../context/AuthContext';
 import apiClient from '../services/apiClient';
+import {
+  calculateItemShares,
+  calculateBillBreakdown,
+  validateCustomShares,
+  type ParticipantBreakdown,
+} from '../utils/splitCalculator';
 
 interface FriendShare {
   userId: string;
   name: string;
-  amount: number;
+  paidAmount: number;
+  shareAmount: number;
+  netAmount: number;
   color: string;
 }
 
@@ -32,62 +40,69 @@ export default function SplitSummaryScreen() {
   const [totalAmount, setTotalAmount] = useState(0);
   const [editingAmounts, setEditingAmounts] = useState<{ [userId: string]: string }>({});
 
-  // Calculate shares on mount
+  // Calculate shares on mount using deterministic split calculator
   useEffect(() => {
     const selectedItems = scannedItems.filter(item => item.selected);
     const total = selectedItems.reduce((sum, item) => sum + item.price, 0);
-    setTotalAmount(total);
+    setTotalAmount(Math.round(total * 100) / 100);
 
     if (selectedItems.length === 0 || !user) return;
 
-    // Calculate who shared each item
-    const sharedBy: { [userId: string]: number } = {};
-
+    // Collect all unique participant IDs from selected items
+    const allParticipantIds = new Set<string>();
     for (const item of selectedItems) {
-      if (item.sharedByUserIds.length === 0) {
-        // If no one selected, skip items with no shares
-        continue;
-      }
-
-      // Use custom shares if available, otherwise equal split
-      if (item.customShares) {
-        for (const userId of item.sharedByUserIds) {
-          sharedBy[userId] = (sharedBy[userId] || 0) + (item.customShares[userId] || 0);
-        }
-      } else {
-        // De-duplicate so the payer is never counted twice (matches backend math)
-        const uniqueSharedBy = Array.from(new Set(item.sharedByUserIds));
-        const splitAmount = item.price / uniqueSharedBy.length;
-        for (const userId of uniqueSharedBy) {
-          sharedBy[userId] = (sharedBy[userId] || 0) + splitAmount;
-        }
+      for (const uid of item.sharedByUserIds) {
+        allParticipantIds.add(uid);
       }
     }
+    const participantIds = Array.from(allParticipantIds);
 
-    // Transform to display format
-    const shares: FriendShare[] = Object.entries(sharedBy).map(([userId, amount]) => ({
-      userId,
-      name: userId === user.id ? 'You' : `User ${userId.slice(0, 4)}`,
-      amount: Math.round(amount * 100) / 100,
-      color: theme.colors.primary,
+    // Build items for the deterministic calculator
+    const itemsToSplit = selectedItems
+      .filter(item => item.sharedByUserIds.length > 0)
+      .map(item => ({
+        name: item.name,
+        price: item.price,
+        sharedByUserIds: item.sharedByUserIds,
+        customShares: item.customShares,
+      }));
+
+    // Use the deterministic breakdown calculator
+    const breakdown = calculateBillBreakdown(
+      Math.round(total * 100) / 100,
+      user.id,
+      participantIds,
+      itemsToSplit
+    );
+
+    // Transform to display format with Paid/Share/Net
+    const shares: FriendShare[] = breakdown.participants.map(p => ({
+      userId: p.userId,
+      name: p.userId === user.id ? 'You' : `User ${p.userId.slice(0, 4)}`,
+      paidAmount: p.paidAmount,
+      shareAmount: p.shareAmount,
+      netAmount: p.netAmount,
+      color: p.userId === user.id ? theme.colors.primary : theme.colors.success,
     }));
 
     setFriendShares(shares);
-    // Initialize editing amounts
+    // Initialize editing amounts with share amounts
     const amounts: { [userId: string]: string } = {};
     shares.forEach(share => {
-      amounts[share.userId] = share.amount.toFixed(2);
+      amounts[share.userId] = share.shareAmount.toFixed(2);
     });
     setEditingAmounts(amounts);
 
-    // Calculate settlements
-    const settlementList: Settlement[] = shares.map(share => ({
-      from: share.name,
-      fromColor: theme.colors.primary,
-      to: 'You',
-      toColor: theme.colors.success,
-      amount: share.amount,
-    }));
+    // Calculate settlements (only non-payer participants who owe money)
+    const settlementList: Settlement[] = shares
+      .filter(share => share.netAmount < 0)
+      .map(share => ({
+        from: share.name,
+        fromColor: theme.colors.primary,
+        to: 'You',
+        toColor: theme.colors.success,
+        amount: Math.abs(share.netAmount),
+      }));
 
     setSettlements(settlementList);
   }, [scannedItems, user]);
@@ -96,21 +111,47 @@ export default function SplitSummaryScreen() {
     setEditingAmounts(prev => ({ ...prev, [userId]: value }));
 
     // Update shares and settlements in real-time
-    const newAmount = parseFloat(value) || 0;
+    const newShareAmount = parseFloat(value) || 0;
+    const isPayer = userId === user?.id;
+    const paidAmount = isPayer ? totalAmount : 0;
+    const newNet = Math.round((paidAmount - newShareAmount) * 100) / 100;
+
     setFriendShares(prev => prev.map(share =>
-      share.userId === userId ? { ...share, amount: newAmount } : share
+      share.userId === userId
+        ? { ...share, shareAmount: newShareAmount, netAmount: newNet }
+        : share
     ));
-    setSettlements(prev => prev.map(settlement => {
+    setSettlements(prev => {
       const share = friendShares.find(s => s.userId === userId);
-      if (share && settlement.from === share.name) {
-        return { ...settlement, amount: newAmount };
-      }
-      return settlement;
-    }));
+      if (!share) return prev;
+      return prev.map(settlement =>
+        settlement.from === share.name
+          ? { ...settlement, amount: Math.abs(newNet) }
+          : settlement
+      );
+    });
   };
+
+  // Validation: sum of edited shares should equal totalAmount
+  const sharesValidation = useMemo(() => {
+    const numericShares: Record<string, number> = {};
+    for (const [uid, val] of Object.entries(editingAmounts)) {
+      numericShares[uid] = parseFloat(val) || 0;
+    }
+    return validateCustomShares(numericShares, totalAmount);
+  }, [editingAmounts, totalAmount]);
 
   const handleConfirm = async () => {
     if (!user) return;
+
+    // Validate shares before saving
+    if (!sharesValidation.isValid) {
+      Alert.alert(
+        'Invalid Split',
+        sharesValidation.message || 'Shares must sum to the bill total',
+      );
+      return;
+    }
 
     setIsLoading(true);
 
@@ -121,19 +162,25 @@ export default function SplitSummaryScreen() {
 
       if (total === 0) return;
 
+      // Build custom shares map from editing amounts if user modified them
+      const customSharesMap: Record<string, number> = {};
+      for (const [uid, val] of Object.entries(editingAmounts)) {
+        customSharesMap[uid] = parseFloat(val) || 0;
+      }
+
       // Create bill items array for backend.
-      // De-duplicate sharedByUserIds so the payer is never counted twice
-      // (group members include the current user and may be toggled on).
+      // De-duplicate sharedByUserIds so the payer is never counted twice.
       const billItems = selectedItems.map(item => ({
         name: item.name,
         price: item.price,
         sharedByUserIds: Array.from(new Set(item.sharedByUserIds)),
+        customShares: item.customShares || undefined,
       }));
 
       // Create bill via API
       await apiClient.post('/bills', {
         title: `Bill ${new Date().toLocaleDateString()}`,
-        totalAmount: total,
+        totalAmount: Math.round(total * 100) / 100,
         groupId: groupId || null,
         paidBy: user.id,
         participantIds: undefined,
@@ -177,14 +224,17 @@ export default function SplitSummaryScreen() {
       <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
         {/* Bill Breakdown Card */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Bill Breakdown</Text>
+          <Text style={styles.cardTitle}>Expense Breakdown</Text>
           <Text style={styles.totalLabel}>Total Amount</Text>
-          <Text style={styles.totalAmount}>₹{totalAmount}</Text>
+          <Text style={styles.totalAmount}>₹{totalAmount.toFixed(2)}</Text>
+          <Text style={styles.paidByLabel}>
+            Paid by You · {friendShares.length} participant{friendShares.length !== 1 ? 's' : ''}
+          </Text>
 
           <View style={styles.divider} />
 
           {friendShares.map((friend, index) => (
-            <View key={index}>
+            <View key={friend.userId}>
               <View style={styles.friendRow}>
                 <View style={[styles.avatar, { backgroundColor: friend.color }]}>
                   {friend.userId === user?.id && user?.profilePictureUrl ? (
@@ -193,17 +243,51 @@ export default function SplitSummaryScreen() {
                     <Text style={styles.avatarText}>{friend.name.charAt(0)}</Text>
                   )}
                 </View>
-                <Text style={styles.friendName}>{friend.name}</Text>
-                <View style={styles.amountInputContainer}>
-                  <Text style={styles.currencySymbol}>₹</Text>
-                  <TextInput
-                    style={styles.amountInput}
-                    value={editingAmounts[friend.userId] || ''}
-                    onChangeText={(value) => handleAmountChange(friend.userId, value)}
-                    keyboardType="numeric"
-                    placeholder="0.00"
-                    placeholderTextColor={theme.colors.textSecondary}
-                  />
+                <View style={styles.friendMeta}>
+                  <Text style={styles.friendName}>
+                    {friend.name} {friend.userId === user?.id ? '(Payer)' : ''}
+                  </Text>
+                  <Text style={styles.friendPaidLabel}>
+                    Paid: ₹{friend.paidAmount.toFixed(2)}
+                  </Text>
+                </View>
+                <View style={styles.shareColumn}>
+                  <View style={styles.amountInputContainer}>
+                    <Text style={styles.currencySymbol}>₹</Text>
+                    <TextInput
+                      style={styles.amountInput}
+                      value={editingAmounts[friend.userId] || ''}
+                      onChangeText={(value) => handleAmountChange(friend.userId, value)}
+                      keyboardType="numeric"
+                      placeholder="0.00"
+                      placeholderTextColor={theme.colors.textSecondary}
+                    />
+                  </View>
+                  <View
+                    style={[
+                      styles.netBadge,
+                      friend.netAmount > 0
+                        ? styles.netBadgePositive
+                        : friend.netAmount < 0
+                        ? styles.netBadgeNegative
+                        : styles.netBadgeZero,
+                    ]}>
+                    <Text
+                      style={[
+                        styles.netBadgeText,
+                        friend.netAmount > 0
+                          ? styles.netTextPositive
+                          : friend.netAmount < 0
+                          ? styles.netTextNegative
+                          : styles.netTextZero,
+                      ]}>
+                      {friend.netAmount > 0
+                        ? `+₹${friend.netAmount.toFixed(2)}`
+                        : friend.netAmount < 0
+                        ? `-₹${Math.abs(friend.netAmount).toFixed(2)}`
+                        : '₹0.00'}
+                    </Text>
+                  </View>
                 </View>
               </View>
               {index < friendShares.length - 1 && <View style={styles.rowDivider} />}
@@ -213,6 +297,29 @@ export default function SplitSummaryScreen() {
           {friendShares.length === 0 && (
             <View style={styles.emptySharesContainer}>
               <Text style={styles.emptySharesText}>No items selected for sharing</Text>
+            </View>
+          )}
+
+          {/* Validation badge */}
+          {friendShares.length > 0 && (
+            <View
+              style={[
+                styles.validationBar,
+                sharesValidation.isValid
+                  ? styles.validationBarSuccess
+                  : styles.validationBarDanger,
+              ]}>
+              <Text
+                style={[
+                  styles.validationBarText,
+                  sharesValidation.isValid
+                    ? styles.validationBarTextSuccess
+                    : styles.validationBarTextDanger,
+                ]}>
+                {sharesValidation.isValid
+                  ? `✓ Shares reconcile to ₹${sharesValidation.sum.toFixed(2)}`
+                  : sharesValidation.message}
+              </Text>
             </View>
           )}
         </View>
@@ -338,6 +445,12 @@ const styles = StyleSheet.create({
     fontWeight: '500',
     color: theme.colors.textPrimary,
     fontFamily: theme.fontFamily.mono,
+    marginBottom: theme.spacing[4],
+  },
+  paidByLabel: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
     marginBottom: theme.spacing[16],
   },
   divider: {
@@ -376,10 +489,22 @@ const styles = StyleSheet.create({
     fontFamily: theme.fontFamily.regular,
   },
   friendName: {
-    flex: 1,
     fontSize: 15,
     color: theme.colors.textPrimary,
     fontFamily: theme.fontFamily.regular,
+  },
+  friendMeta: {
+    flex: 1,
+  },
+  friendPaidLabel: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+    marginTop: 2,
+  },
+  shareColumn: {
+    alignItems: 'flex-end',
+    gap: 4,
   },
   amountInputContainer: {
     flexDirection: 'row',
@@ -508,5 +633,57 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '500',
     fontFamily: theme.fontFamily.regular,
+  },
+  netBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  netBadgePositive: {
+    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+  },
+  netBadgeNegative: {
+    backgroundColor: 'rgba(239, 68, 68, 0.10)',
+  },
+  netBadgeZero: {
+    backgroundColor: 'rgba(148, 163, 184, 0.10)',
+  },
+  netBadgeText: {
+    fontSize: 12,
+    fontWeight: '600',
+    fontFamily: theme.fontFamily.mono,
+  },
+  netTextPositive: {
+    color: theme.colors.success,
+  },
+  netTextNegative: {
+    color: theme.colors.danger,
+  },
+  netTextZero: {
+    color: theme.colors.textSecondary,
+  },
+  validationBar: {
+    marginTop: theme.spacing[12],
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  validationBarSuccess: {
+    backgroundColor: 'rgba(16, 185, 129, 0.10)',
+  },
+  validationBarDanger: {
+    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+  },
+  validationBarText: {
+    fontSize: 12,
+    fontWeight: '500',
+    fontFamily: theme.fontFamily.regular,
+  },
+  validationBarTextSuccess: {
+    color: theme.colors.success,
+  },
+  validationBarTextDanger: {
+    color: theme.colors.danger,
   },
 });
