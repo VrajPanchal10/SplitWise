@@ -9,4 +9,8 @@ public class BillItemRequest {
     private String name;
     private Double price;
     private List<String> sharedByUserIds;
+    /** Quantity extracted from OCR (optional, null if not detected). */
+    private Double quantity;
+    /** Unit price extracted from OCR (optional, null if not detected). */
+    private Double unitPrice;
 }

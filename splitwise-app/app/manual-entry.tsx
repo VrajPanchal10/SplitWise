@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, TextInput, ScrollView, ActivityIndicator, Alert, Image } from 'react-native';
-import { ChevronLeft, Check } from 'lucide-react-native';
+import { ChevronLeft, Check, ChevronDown, ChevronUp, AlertTriangle, Edit3 } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../context/AuthContext';
+import { useBillCreation } from '../context/BillCreationContext';
 import apiClient from '../services/apiClient';
 
 interface Friend {
@@ -11,6 +12,14 @@ interface Friend {
   fullName: string;
   email: string;
   profilePictureUrl?: string;
+}
+
+interface OcrItem {
+  id: string;
+  name: string;
+  price: number;
+  quantity: number | null;
+  unitPrice: number | null;
 }
 
 export default function ManualEntryScreen() {
@@ -22,7 +31,10 @@ export default function ManualEntryScreen() {
   const scannedTitle = params.scannedTitle as string | undefined;
   const scannedAmount = params.scannedAmount as string | undefined;
   const receiptUrl = params.receiptUrl as string | undefined;
+  const ocrConfidence = params.ocrConfidence as string | undefined;
+  const ocrFinancialsRaw = params.ocrFinancials as string | undefined;
   const { user } = useAuth();
+  const { scannedItems, setScannedItems } = useBillCreation();
   const [isLoading, setIsLoading] = useState(false);
   const [title, setTitle] = useState(scannedTitle || '');
   const [amount, setAmount] = useState(scannedAmount || '');
@@ -35,6 +47,38 @@ export default function ManualEntryScreen() {
   const [titleError, setTitleError] = useState('');
   const [amountError, setAmountError] = useState('');
   const [participantError, setParticipantError] = useState('');
+
+  // OCR items for review/edit
+  const [ocrItems, setOcrItems] = useState<OcrItem[]>([]);
+  const [showOcrItems, setShowOcrItems] = useState(false);
+  const [editingItemId, setEditingItemId] = useState<string | null>(null);
+
+  // Financial breakdown from OCR
+  const ocrFinancials = (() => {
+    try {
+      return ocrFinancialsRaw ? JSON.parse(ocrFinancialsRaw) : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  // Whether this screen was opened from OCR scan
+  const isFromOcr = !!(scannedTitle || scannedAmount || ocrConfidence);
+
+  // Load scanned items from context when coming from OCR
+  useEffect(() => {
+    if (scannedItems && scannedItems.length > 0 && isFromOcr) {
+      const items: OcrItem[] = scannedItems.map((item: any) => ({
+        id: item.id,
+        name: item.name,
+        price: item.price,
+        quantity: item.quantity || null,
+        unitPrice: item.unitPrice || null,
+      }));
+      setOcrItems(items);
+      setShowOcrItems(true);
+    }
+  }, []);
 
   useEffect(() => {
     if (groupId) {
@@ -147,6 +191,64 @@ export default function ManualEntryScreen() {
     }
   };
 
+  // OCR item editing handlers
+  const syncItemsToContext = (items: OcrItem[]) => {
+    setScannedItems(items.map(item => ({
+      id: item.id,
+      name: item.name,
+      price: item.price,
+      quantity: item.quantity,
+      unitPrice: item.unitPrice,
+      selected: true,
+      sharedByUserIds: [],
+    })));
+  };
+
+  const updateOcrItemName = (itemId: string, newName: string) => {
+    setOcrItems(prev => {
+      const next = prev.map(item =>
+        item.id === itemId ? { ...item, name: newName } : item
+      );
+      syncItemsToContext(next);
+      return next;
+    });
+  };
+
+  const updateOcrItemPrice = (itemId: string, newPriceStr: string) => {
+    const newPrice = parseFloat(newPriceStr) || 0;
+    setOcrItems(prev => {
+      const next = prev.map(item =>
+        item.id === itemId ? { ...item, price: newPrice } : item
+      );
+      syncItemsToContext(next);
+      return next;
+    });
+  };
+
+  const updateOcrItemQty = (itemId: string, newQtyStr: string) => {
+    const newQty = parseFloat(newQtyStr) || null;
+    setOcrItems(prev => {
+      const next = prev.map(item =>
+        item.id === itemId ? { ...item, quantity: newQty } : item
+      );
+      syncItemsToContext(next);
+      return next;
+    });
+  };
+
+  const removeOcrItem = (itemId: string) => {
+    setOcrItems(prev => {
+      const next = prev.filter(item => item.id !== itemId);
+      syncItemsToContext(next);
+      return next;
+    });
+  };
+
+  const recalculateTotalFromItems = () => {
+    const sum = ocrItems.reduce((acc, item) => acc + (item.price || 0), 0);
+    setAmount(String(Math.round(sum * 100) / 100));
+  };
+
   const handleSave = async () => {
     // Clear previous errors
     setTitleError('');
@@ -178,17 +280,29 @@ export default function ManualEntryScreen() {
     setIsLoading(true);
 
     try {
-      const billData: any = {
-        title: title.trim(),
-        totalAmount: totalAmount,
-        paidBy: user.id,
-        items: [
+      // Build items list: use OCR items if available, otherwise single item
+      let items;
+      if (ocrItems.length > 0) {
+        items = ocrItems.map(item => ({
+          name: item.name,
+          price: item.price,
+          sharedByUserIds,
+        }));
+      } else {
+        items = [
           {
             name: title.trim(),
             price: totalAmount,
             sharedByUserIds,
           }
-        ],
+        ];
+      }
+
+      const billData: any = {
+        title: title.trim(),
+        totalAmount: totalAmount,
+        paidBy: user.id,
+        items,
       };
 
       if (receiptUrl) {
@@ -237,6 +351,15 @@ export default function ManualEntryScreen() {
   // Determine if we're in group mode
   const isGroupMode = groupId !== undefined;
 
+  const getConfidenceColor = () => {
+    switch (ocrConfidence) {
+      case 'HIGH': return theme.colors.success;
+      case 'MEDIUM': return '#D4A017';
+      case 'LOW': return theme.colors.danger;
+      default: return theme.colors.textSecondary;
+    }
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -248,6 +371,22 @@ export default function ManualEntryScreen() {
       </View>
 
       <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
+        {/* OCR Confidence Banner */}
+        {isFromOcr && ocrConfidence && (
+          <View style={[styles.confidenceBanner, { borderLeftColor: getConfidenceColor() }]}>
+            {ocrConfidence !== 'HIGH' && (
+              <AlertTriangle size={16} color={getConfidenceColor()} />
+            )}
+            <Text style={[styles.confidenceText, { color: getConfidenceColor() }]}>
+              {ocrConfidence === 'HIGH'
+                ? '✓ OCR confidence: High — please verify details'
+                : ocrConfidence === 'MEDIUM'
+                ? 'OCR confidence: Medium — some values may need correction'
+                : 'OCR confidence: Low — values are unreliable, please verify all fields'}
+            </Text>
+          </View>
+        )}
+
         <View style={styles.formSection}>
           <View style={styles.inputContainer}>
             <Text style={styles.inputLabel}>Title *</Text>
@@ -297,6 +436,160 @@ export default function ManualEntryScreen() {
             </View>
           </View>
         </View>
+
+        {/* OCR Scanned Items Section */}
+        {isFromOcr && ocrItems.length > 0 && (
+          <View style={styles.ocrSection}>
+            <TouchableOpacity
+              style={styles.ocrSectionHeader}
+              onPress={() => setShowOcrItems(!showOcrItems)}
+              activeOpacity={0.7}>
+              <Text style={styles.sectionTitle}>
+                Scanned Items ({ocrItems.length})
+              </Text>
+              {showOcrItems ? (
+                <ChevronUp size={20} color={theme.colors.textSecondary} />
+              ) : (
+                <ChevronDown size={20} color={theme.colors.textSecondary} />
+              )}
+            </TouchableOpacity>
+
+            {showOcrItems && (
+              <View style={styles.ocrItemsList}>
+                {ocrItems.map((item) => (
+                  <View key={item.id} style={styles.ocrItemCard}>
+                    {editingItemId === item.id ? (
+                      /* Editing mode */
+                      <View style={styles.ocrItemEditContainer}>
+                        <TextInput
+                          style={styles.ocrItemNameInput}
+                          value={item.name}
+                          onChangeText={(text) => updateOcrItemName(item.id, text)}
+                          placeholder="Item name"
+                          placeholderTextColor={theme.colors.textSecondary}
+                        />
+                        <View style={styles.ocrItemEditRow}>
+                          {item.quantity !== null && (
+                            <View style={styles.ocrItemEditField}>
+                              <Text style={styles.ocrItemEditLabel}>Qty</Text>
+                              <TextInput
+                                style={styles.ocrItemSmallInput}
+                                value={item.quantity !== null ? String(item.quantity) : ''}
+                                onChangeText={(text) => updateOcrItemQty(item.id, text)}
+                                keyboardType="numeric"
+                              />
+                            </View>
+                          )}
+                          <View style={[styles.ocrItemEditField, { flex: 1 }]}>
+                            <Text style={styles.ocrItemEditLabel}>Price</Text>
+                            <TextInput
+                              style={styles.ocrItemSmallInput}
+                              value={String(item.price)}
+                              onChangeText={(text) => updateOcrItemPrice(item.id, text)}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                        </View>
+                        <View style={styles.ocrItemEditActions}>
+                          <TouchableOpacity
+                            style={styles.ocrItemDoneBtn}
+                            onPress={() => setEditingItemId(null)}>
+                            <Text style={styles.ocrItemDoneBtnText}>Done</Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={styles.ocrItemRemoveBtn}
+                            onPress={() => removeOcrItem(item.id)}>
+                            <Text style={styles.ocrItemRemoveBtnText}>Remove</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    ) : (
+                      /* Display mode */
+                      <TouchableOpacity
+                        style={styles.ocrItemDisplay}
+                        onPress={() => setEditingItemId(item.id)}
+                        activeOpacity={0.7}>
+                        <View style={styles.ocrItemInfo}>
+                          <Text style={styles.ocrItemName}>{item.name}</Text>
+                          {item.quantity !== null && (
+                            <Text style={styles.ocrItemQty}>
+                              Qty: {item.quantity}
+                              {item.unitPrice !== null ? ` × ₹${item.unitPrice}` : ''}
+                            </Text>
+                          )}
+                        </View>
+                        <View style={styles.ocrItemRight}>
+                          <Text style={styles.ocrItemPrice}>₹{item.price}</Text>
+                          <Edit3 size={14} color={theme.colors.textSecondary} />
+                        </View>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                ))}
+
+                {/* Recalculate total from items */}
+                <TouchableOpacity
+                  style={styles.recalcButton}
+                  onPress={recalculateTotalFromItems}>
+                  <Text style={styles.recalcButtonText}>
+                    Use item total (₹{Math.round(ocrItems.reduce((s, i) => s + (i.price || 0), 0) * 100) / 100})
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        )}
+
+        {/* OCR Financial Breakdown */}
+        {isFromOcr && ocrFinancials && (
+          <View style={styles.financialSection}>
+            <Text style={styles.financialTitle}>Receipt Breakdown</Text>
+            {ocrFinancials.subtotal && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>Subtotal</Text>
+                <Text style={styles.financialValue}>₹{ocrFinancials.subtotal}</Text>
+              </View>
+            )}
+            {ocrFinancials.cgst && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>CGST</Text>
+                <Text style={styles.financialValue}>₹{ocrFinancials.cgst}</Text>
+              </View>
+            )}
+            {ocrFinancials.sgst && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>SGST</Text>
+                <Text style={styles.financialValue}>₹{ocrFinancials.sgst}</Text>
+              </View>
+            )}
+            {ocrFinancials.tax && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>Tax</Text>
+                <Text style={styles.financialValue}>₹{ocrFinancials.tax}</Text>
+              </View>
+            )}
+            {ocrFinancials.serviceCharge && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>Service Charge</Text>
+                <Text style={styles.financialValue}>₹{ocrFinancials.serviceCharge}</Text>
+              </View>
+            )}
+            {ocrFinancials.discount && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>Discount</Text>
+                <Text style={[styles.financialValue, { color: theme.colors.success }]}>
+                  -₹{Math.abs(ocrFinancials.discount)}
+                </Text>
+              </View>
+            )}
+            {ocrFinancials.roundOff && (
+              <View style={styles.financialRow}>
+                <Text style={styles.financialLabel}>Round Off</Text>
+                <Text style={styles.financialValue}>₹{ocrFinancials.roundOff}</Text>
+              </View>
+            )}
+          </View>
+        )}
 
         {/* Split With Section */}
         {isGroupMode ? (
@@ -470,6 +763,25 @@ const styles = StyleSheet.create({
   body: {
     flex: 1,
   },
+  // OCR Confidence Banner
+  confidenceBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.spacing[8],
+    marginHorizontal: theme.spacing[24],
+    marginTop: theme.spacing[8],
+    marginBottom: theme.spacing[4],
+    paddingHorizontal: theme.spacing[12],
+    paddingVertical: theme.spacing[8],
+    backgroundColor: theme.colors.surface,
+    borderRadius: 10,
+    borderLeftWidth: 3,
+  },
+  confidenceText: {
+    fontSize: 13,
+    fontFamily: theme.fontFamily.regular,
+    flex: 1,
+  },
   formSection: {
     paddingHorizontal: theme.spacing[24],
     marginTop: theme.spacing[24],
@@ -545,6 +857,168 @@ const styles = StyleSheet.create({
     color: theme.colors.textSecondary,
     fontFamily: theme.fontFamily.regular,
   },
+  // OCR Items Section
+  ocrSection: {
+    paddingHorizontal: theme.spacing[24],
+    marginTop: theme.spacing[24],
+  },
+  ocrSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  ocrItemsList: {
+    marginTop: theme.spacing[12],
+  },
+  ocrItemCard: {
+    backgroundColor: theme.colors.surface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 12,
+    marginBottom: theme.spacing[8],
+    overflow: 'hidden',
+  },
+  ocrItemDisplay: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: theme.spacing[12],
+  },
+  ocrItemInfo: {
+    flex: 1,
+    marginRight: theme.spacing[12],
+  },
+  ocrItemName: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  ocrItemQty: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+    fontFamily: theme.fontFamily.regular,
+  },
+  ocrItemRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.spacing[8],
+  },
+  ocrItemPrice: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  // OCR Item Edit Mode
+  ocrItemEditContainer: {
+    padding: theme.spacing[12],
+  },
+  ocrItemNameInput: {
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    fontSize: 14,
+    color: theme.colors.textPrimary,
+    paddingVertical: theme.spacing[4],
+    marginBottom: theme.spacing[8],
+    fontFamily: theme.fontFamily.regular,
+  },
+  ocrItemEditRow: {
+    flexDirection: 'row',
+    gap: theme.spacing[12],
+  },
+  ocrItemEditField: {
+    minWidth: 70,
+  },
+  ocrItemEditLabel: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    marginBottom: 2,
+    fontFamily: theme.fontFamily.regular,
+  },
+  ocrItemSmallInput: {
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    fontSize: 14,
+    color: theme.colors.textPrimary,
+    paddingVertical: theme.spacing[4],
+    fontFamily: theme.fontFamily.mono,
+  },
+  ocrItemEditActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: theme.spacing[12],
+    marginTop: theme.spacing[8],
+  },
+  ocrItemDoneBtn: {
+    paddingHorizontal: theme.spacing[12],
+    paddingVertical: theme.spacing[4],
+    backgroundColor: theme.colors.primary,
+    borderRadius: 6,
+  },
+  ocrItemDoneBtnText: {
+    color: theme.colors.cream,
+    fontSize: 13,
+    fontWeight: '500',
+    fontFamily: theme.fontFamily.regular,
+  },
+  ocrItemRemoveBtn: {
+    paddingHorizontal: theme.spacing[12],
+    paddingVertical: theme.spacing[4],
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: theme.colors.danger,
+  },
+  ocrItemRemoveBtnText: {
+    color: theme.colors.danger,
+    fontSize: 13,
+    fontWeight: '500',
+    fontFamily: theme.fontFamily.regular,
+  },
+  recalcButton: {
+    alignSelf: 'flex-end',
+    paddingHorizontal: theme.spacing[12],
+    paddingVertical: theme.spacing[8],
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: theme.colors.primary,
+    marginTop: theme.spacing[4],
+  },
+  recalcButtonText: {
+    color: theme.colors.primary,
+    fontSize: 13,
+    fontWeight: '500',
+    fontFamily: theme.fontFamily.regular,
+  },
+  // Financial Breakdown
+  financialSection: {
+    paddingHorizontal: theme.spacing[24],
+    marginTop: theme.spacing[24],
+  },
+  financialTitle: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: theme.colors.textPrimary,
+    marginBottom: theme.spacing[8],
+    fontFamily: theme.fontFamily.regular,
+  },
+  financialRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: theme.spacing[4],
+  },
+  financialLabel: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  financialValue: {
+    fontSize: 13,
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  // Split section
   splitSection: {
     paddingHorizontal: theme.spacing[24],
     marginTop: theme.spacing[32],

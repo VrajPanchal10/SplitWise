@@ -7,6 +7,10 @@ export interface BillItem {
   selected: boolean;
   sharedByUserIds: string[];
   customShares?: { [userId: string]: number };
+  /** Quantity extracted from OCR (optional, null if not detected). */
+  quantity?: number | null;
+  /** Unit price extracted from OCR (optional, null if not detected). */
+  unitPrice?: number | null;
 }
 
 interface BillCreationContextType {

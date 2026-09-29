@@ -111,11 +111,13 @@ export default function ScanBillScreen() {
         );
       }
 
-      // Transform OCR response to BillItem format
+      // Transform OCR response to BillItem format, preserving qty/unitPrice
       const billItems = ocrItems.map((item: any, index: number) => ({
         id: `item-${index}`,
         name: item.name || item.description || 'Unknown Item',
         price: item.price || 0,
+        quantity: item.quantity || null,
+        unitPrice: item.unitPrice || null,
         selected: true,
         sharedByUserIds: [],
       }));
@@ -137,10 +139,11 @@ export default function ScanBillScreen() {
         receiptUrl,
       });
 
-      // Navigate to manual-entry with extracted title, amount, and receiptUrl
+      // Navigate to manual-entry with extracted data and financial breakdown
       const navParams: any = {
         scannedTitle: extractedTitle,
         scannedAmount: String(finalTotal),
+        ocrConfidence: confidence,
       };
       if (receiptUrl) {
         navParams.receiptUrl = receiptUrl;
@@ -148,6 +151,19 @@ export default function ScanBillScreen() {
       if (groupId) {
         navParams.groupId = groupId;
       }
+      // Pass financial breakdown as JSON for the review screen
+      const financials: any = {};
+      if (response.data.subtotal) financials.subtotal = response.data.subtotal;
+      if (response.data.cgst) financials.cgst = response.data.cgst;
+      if (response.data.sgst) financials.sgst = response.data.sgst;
+      if (response.data.tax) financials.tax = response.data.tax;
+      if (response.data.serviceCharge) financials.serviceCharge = response.data.serviceCharge;
+      if (response.data.discount) financials.discount = response.data.discount;
+      if (response.data.roundOff) financials.roundOff = response.data.roundOff;
+      if (Object.keys(financials).length > 0) {
+        navParams.ocrFinancials = JSON.stringify(financials);
+      }
+
       router.push({ pathname: '/manual-entry', params: navParams });
     } catch (error: any) {
       console.error('OCR scan error:', error);

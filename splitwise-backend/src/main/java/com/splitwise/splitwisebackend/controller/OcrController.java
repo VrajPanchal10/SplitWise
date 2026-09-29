@@ -31,7 +31,9 @@ public class OcrController {
      *
      * @param image the uploaded image file (form-data, key name "image")
      * @return JSON response with rawText (for debugging), suggestedTitle,
-     *         totalAmount, confidence, items (parsed BillItemRequest list), and receiptUrl
+     *         totalAmount, confidence, items (parsed BillItemRequest list),
+     *         receiptUrl, and financial breakdown fields (subtotal, cgst, sgst,
+     *         tax, serviceCharge, discount, roundOff)
      */
     @PostMapping("/scan")
     public ResponseEntity<Map<String, Object>> scanReceipt(@RequestParam("image") MultipartFile image) {
@@ -51,13 +53,21 @@ public class OcrController {
         ReceiptParseResult parseResult = receiptParserService.parseReceiptText(rawText);
 
         // Return raw text plus the structured parse result and receiptUrl
-        Map<String, Object> response = new java.util.HashMap<>();
+        Map<String, Object> response = new java.util.LinkedHashMap<>();
         response.put("rawText", rawText);
         response.put("items", parseResult.getItems());
         response.put("suggestedTitle", parseResult.getSuggestedTitle());
         response.put("totalAmount", parseResult.getTotalAmount());
         response.put("confidence", parseResult.getConfidence());
         response.put("receiptUrl", receiptUrl);
+        // Financial breakdown fields
+        response.put("subtotal", parseResult.getSubtotal());
+        response.put("cgst", parseResult.getCgst());
+        response.put("sgst", parseResult.getSgst());
+        response.put("tax", parseResult.getTax());
+        response.put("serviceCharge", parseResult.getServiceCharge());
+        response.put("discount", parseResult.getDiscount());
+        response.put("roundOff", parseResult.getRoundOff());
 
         return ResponseEntity.ok(response);
     }
