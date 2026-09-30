@@ -28,29 +28,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const isAuthenticated = !!user;
 
-  // Check for existing session on app mount
+  // Restore session from AsyncStorage on app mount
   useEffect(() => {
     const checkAuth = async () => {
-  try {
-    console.log('[AUTH] checkAuth started');
+      try {
+        const [token, userData] = await Promise.all([
+          AsyncStorage.getItem('authToken'),
+          AsyncStorage.getItem('userData'),
+        ]);
 
-    const token = await AsyncStorage.getItem('authToken');
-    console.log('[AUTH] token read:', !!token);
-
-    const userData = await AsyncStorage.getItem('userData');
-    console.log('[AUTH] userData read:', !!userData);
-
-    if (token && userData) {
-      setUser(JSON.parse(userData));
-      console.log('[AUTH] existing session restored');
-    }
-  } catch (error) {
-    console.error('[AUTH] Error checking auth:', error);
-  } finally {
-    console.log('[AUTH] setting isLoading=false');
-    setIsLoading(false);
-  }
-};
+        if (token && userData) {
+          setUser(JSON.parse(userData));
+        }
+      } catch (error) {
+        console.error('Error checking auth:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
     checkAuth();
   }, []);
 

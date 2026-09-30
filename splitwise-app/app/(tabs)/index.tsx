@@ -156,65 +156,6 @@ export default function HomeScreen() {
 
   const overallBalance = youAreOwed - youOwe;
 
-  if (isLoading) {
-    return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color={theme.colors.primary} />
-      </View>
-    );
-  }
-
-  if (groups.length === 0) {
-    const emptyHeroStyle = [
-      styles.hero,
-      { paddingTop: insets.top + theme.spacing[16] },
-    ];
-
-    return (
-      <View style={styles.container}>
-        {/* Hero Header */}
-        <View style={emptyHeroStyle}>
-          <View style={styles.heroCircle} />
-          <View style={styles.heroTop}>
-            <View style={styles.logoContainer}>
-              <View style={styles.logoMark}>
-                <Receipt size={16} color={theme.colors.cream} />
-              </View>
-              <Text style={styles.logoText}>SplitWise</Text>
-            </View>
-            <TouchableOpacity
-              onPress={() => router.push('/(tabs)/profile')}
-              style={styles.avatar}>
-              {user?.profilePictureUrl ? (
-                <Image
-                  key={user.profilePictureUrl}
-                  source={{ uri: user.profilePictureUrl }}
-                  style={styles.avatarImage}
-                  resizeMode="cover"
-                  onError={(e) => console.log('[DEBUG] Avatar image failed to load:', e.nativeEvent?.error)}
-                />
-              ) : (
-                <Text style={styles.avatarText}>{user?.fullName?.charAt(0) || 'U'}</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-          <ZigzagEdge />
-        </View>
-
-        <View style={styles.emptyContainer}>
-          <Receipt size={64} color={theme.colors.border} />
-          <Text style={styles.emptyTitle}>No groups yet</Text>
-          <Text style={styles.emptySubtitle}>Create a group to start splitting bills</Text>
-          <TouchableOpacity
-            style={styles.createGroupButton}
-            onPress={() => router.push('/add-group')}>
-            <Text style={styles.createGroupButtonText}>Create Group</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  }
-
   const heroStyle = [
     styles.hero,
     { paddingTop: insets.top + theme.spacing[16] },
@@ -273,6 +214,25 @@ export default function HomeScreen() {
 
       {/* Body Content */}
       <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
+        {isLoading ? (
+          <View style={[styles.loadingContainer, { paddingVertical: 60 }]}>
+            <ActivityIndicator size="large" color={theme.colors.primary} />
+          </View>
+        ) : groups.length === 0 ? (
+          <View style={[styles.emptyContainer, { paddingVertical: 60 }]}>
+            <Receipt size={64} color={theme.colors.border} />
+            <Text style={styles.emptyTitle}>No groups yet</Text>
+            <Text style={styles.emptySubtitle}>Create a group to start splitting bills</Text>
+            <TouchableOpacity
+              style={styles.createGroupButton}
+              onPress={() => router.push('/add-group')}>
+              <Text style={styles.createGroupButtonText}>Create Group</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <>
+
+
         {/* Stat Cards */}
         <View style={styles.statsRow}>
           <StatCard
@@ -311,6 +271,8 @@ export default function HomeScreen() {
           <Camera size={20} color={theme.colors.cream} />
           <Text style={styles.scanButtonText}>Create Group</Text>
         </TouchableOpacity>
+          </>
+        )}
       </ScrollView>
     </View>
   );

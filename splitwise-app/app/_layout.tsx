@@ -12,16 +12,25 @@ export const unstable_settings = {
   anchor: '(tabs)',
 };
 
+import { useEffect } from 'react';
+import * as SplashScreen from 'expo-splash-screen';
+
+// Prevent the splash screen from auto-hiding before asset loading is complete.
+SplashScreen.preventAutoHideAsync();
+
 function RootLayoutContent() {
   const colorScheme = useColorScheme();
   const { isLoading, isAuthenticated } = useAuth();
 
+  useEffect(() => {
+    if (!isLoading) {
+      SplashScreen.hideAsync();
+    }
+  }, [isLoading]);
+
   if (isLoading) {
-    return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
+    // Return null instead of ActivityIndicator so the native splash screen stays visible
+    return null;
   }
 
   // Conditional rendering based on auth state

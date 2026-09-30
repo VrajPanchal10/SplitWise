@@ -429,4 +429,186 @@ class SplitCalculationServiceTest {
         Map<String, Double> shares2 = service.calculateIndividualShares(nullItemParticipants);
         assertTrue(shares2.isEmpty());
     }
+
+    // ====================================================================
+    // SETTLEMENT & DEBT SIMPLIFICATION TESTS
+    // ====================================================================
+
+    @Test
+    void simplifyDebts_twoPeople_singleTransaction() {
+        Map<String, Double> balances = Map.of(
+                "alice", 50.0,
+                "bob", -50.0
+        );
+
+        List<Settlement> settlements = service.simplifyDebts(balances);
+        assertEquals(1, settlements.size());
+        assertEquals("bob", settlements.get(0).getFromUserId());
+        assertEquals("alice", settlements.get(0).getToUserId());
+        assertEquals(50.0, settlements.get(0).getAmount(), 0.001);
+    }
+
+    @Test
+    void simplifyDebts_threePeople_circularDebtZeroBalances_emptySettlements() {
+        // When debts cancel out into zero balances, no settlements should be produced
+        Map<String, Double> balances = Map.of(
+                "alice", 0.0,
+                "bob", 0.0,
+                "charlie", 0.0
+        );
+
+        List<Settlement> settlements = service.simplifyDebts(balances);
+        assertTrue(settlements.isEmpty(), "Zero balances must produce no settlements");
+    }
+
+    @Test
+    void simplifyDebts_threePeople_multipleDebtorsSingleCreditor() {
+        // Alice is owed 150; Bob owes 100, Charlie owes 50
+        Map<String, Double> balances = Map.of(
+                "alice", 150.0,
+                "bob", -100.0,
+                "charlie", -50.0
+        );
+
+        List<Settlement> settlements = service.simplifyDebts(balances);
+        assertEquals(2, settlements.size());
+
+        // Bob -> Alice 100.0, Charlie -> Alice 50.0
+        Settlement s1 = settlements.get(0);
+        assertEquals("bob", s1.getFromUserId());
+        assertEquals("alice", s1.getToUserId());
+        assertEquals(100.0, s1.getAmount(), 0.001);
+
+        Settlement s2 = settlements.get(1);
+        assertEquals("charlie", s2.getFromUserId());
+        assertEquals("alice", s2.getToUserId());
+        assertEquals(50.0, s2.getAmount(), 0.001);
+
+        // Money conservation check
+        double totalPaid = settlements.stream().mapToDouble(Settlement::getAmount).sum();
+        assertEquals(150.0, totalPaid, 0.001);
+    }
+
+    @Test
+    void simplifyDebts_threePeople_multipleCreditorsSingleDebtor() {
+        // Charlie owes 150; Alice is owed 80, Bob is owed 70
+        Map<String, Double> balances = Map.of(
+                "alice", 80.0,
+                "bob", 70.0,
+                "charlie", -150.0
+        );
+
+        List<Settlement> settlements = service.simplifyDebts(balances);
+        assertEquals(2, settlements.size());
+
+        for (Settlement s : settlements) {
+            assertEquals("charlie", s.getFromUserId(), "Charlie must pay both creditors");
+        }
+
+        double totalPaid = settlements.stream().mapToDouble(Settlement::getAmount).sum();
+        assertEquals(150.0, totalPaid, 0.001, "Total money paid must equal 150.0");
+    }
+
+    @Test
+    void simplifyDebts_fivePlusPeople_exactMatchAndGreedySimplification() {
+        // 5 people:
+        // Creditors: Alice (+100.00), Bob (+50.00) => +150.00
+        // Debtors: Charlie (-60.00), Dave (-50.00), Eve (-40.00) => -150.00
+        //
+        // Exact match optimization:
+        // Dave (-50.00) exactly matches Bob (+50.00) -> 1 transaction (Dave -> Bob: 50.00)
+        // Remaining: Charlie (-60.00) & Eve (-40.00) -> Alice (+100.00)
+        // Total transactions = 3 (optimal!)
+        Map<String, Double> balances = Map.of(
+                "alice", 100.0,
+                "bob", 50.0,
+                "charlie", -60.0,
+                "dave", -50.0,
+                "eve", -40.0
+        );
+
+        List<Settlement> settlements = service.simplifyDebts(balances);
+        assertEquals(3, settlements.size(), "5-person graph simplifies to exactly 3 transactions");
+
+        // Verify Dave paid Bob 50.00 directly
+        Settlement daveBob = settlements.stream()
+                .filter(s -> s.getFromUserId().equals("dave") && s.getToUserId().equals("bob"))
+                .findFirst().orElse(null);
+        assertNotNull(daveBob, "Dave should pay Bob 50.00 via exact match");
+        assertEquals(50.0, daveBob.getAmount(), 0.001);
+
+        // Verify total money conserved
+        double totalPaid = settlements.stream().mapToDouble(Settlement::getAmount).sum();
+        assertEquals(150.0, totalPaid, 0.001, "Total money must be conserved");
+    }
+
+    @Test
+    void simplifyDebts_decimalAmountsAndRounding() {
+        // Decimal cents: 100 / 3
+        Map<String, Double> balances = Map.of(
+                "alice", 66.66,
+                "bob", -33.33,
+                "charlie", -33.33
+        );
+
+        List<Settlement> settlements = service.simplifyDebts(balances);
+        assertEquals(2, settlements.size());
+
+        double totalPaid = settlements.stream().mapToDouble(Settlement::getAmount).sum();
+        assertEquals(66.66, Math.round(totalPaid * 100.0) / 100.0, 0.001,
+                "Decimal cents must be conserved without losing pennies");
+
+        for (Settlement s : settlements) {
+            assertEquals("alice", s.getToUserId());
+            assertEquals(33.33, s.getAmount(), 0.001);
+        }
+    }
+
+    @Test
+    void getSettlementsForGroup_alreadySettledGroup_returnsEmptyList() {
+        // Group with 1 bill where Harsh paid 200 split between Harsh and Kiran
+        Bill bill = bill("b-settled", "group-settled", "harsh", 200.0,
+                List.of(item("Hotel", 200.0, List.of("harsh", "kiran"))));
+
+        when(billRepository.findByGroupId("group-settled")).thenReturn(List.of(bill));
+
+        // Kiran already paid Harsh 100.00
+        SettlementRecord paidRecord = new SettlementRecord();
+        paidRecord.setGroupId("group-settled");
+        paidRecord.setFromUserId("kiran");
+        paidRecord.setToUserId("harsh");
+        paidRecord.setAmount(100.0);
+        paidRecord.setStatus(SettlementRecord.Status.PAID);
+
+        when(settlementRecordRepository.findByGroupIdAndStatus("group-settled", SettlementRecord.Status.PAID))
+                .thenReturn(List.of(paidRecord));
+
+        List<Settlement> settlements = service.getSettlementsForGroup("group-settled");
+        assertTrue(settlements.isEmpty(), "An already settled group must return no pending settlements");
+    }
+
+    @Test
+    void calculateNetBalancesForGroup_conservesMoney_sumIsZero() {
+        // Multi-bill scenario with multiple payers
+        Bill bill1 = bill("b1", "group-multi", "p1", 300.0,
+                List.of(item("Dinner", 300.0, List.of("p1", "p2", "p3"))));
+        Bill bill2 = bill("b2", "group-multi", "p2", 150.0,
+                List.of(item("Taxi", 150.0, List.of("p1", "p2", "p3"))));
+
+        when(billRepository.findByGroupId("group-multi")).thenReturn(List.of(bill1, bill2));
+
+        Map<String, Double> netBalances = service.calculateNetBalancesForGroup("group-multi");
+
+        // Invariant: sum of all net balances must equal 0.00
+        double sum = netBalances.values().stream().mapToDouble(Double::doubleValue).sum();
+        assertEquals(0.00, Math.round(sum * 100.0) / 100.0, 0.001,
+                "Sum of all net balances must be identically zero");
+
+        // p1 paid 300, owes 100 + 50 = 150 => net +150
+        assertEquals(150.0, netBalances.get("p1"), 0.001);
+        // p2 paid 150, owes 100 + 50 = 150 => net 0
+        assertEquals(0.0, netBalances.get("p2"), 0.001);
+        // p3 paid 0, owes 100 + 50 = 150 => net -150
+        assertEquals(-150.0, netBalances.get("p3"), 0.001);
+    }
 }

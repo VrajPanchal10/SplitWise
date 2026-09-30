@@ -63,8 +63,12 @@ export default function SettlementScreen() {
   const pendingSettlements = settlements.filter(s => !s.paid);
   const allSettled = pendingSettlements.length === 0;
 
-  const renderSettlementItem = ({ item }: { item: Settlement }) => (
-    <View style={[styles.settlementCard, item.paid && styles.settlementCardPaid]}>
+  const youOwe = pendingSettlements.filter(s => s.from === 'You');
+  const youWillReceive = pendingSettlements.filter(s => s.to === 'You');
+  const suggestedSettlements = pendingSettlements.filter(s => s.from !== 'You' && s.to !== 'You');
+
+  const renderSettlementItem = (item: Settlement) => (
+    <View key={item.id} style={[styles.settlementCard, item.paid && styles.settlementCardPaid]}>
       <View style={styles.avatarsContainer}>
         <View style={[styles.avatar, { backgroundColor: item.fromColor }]}>
           {item.from === 'You' && user?.profilePictureUrl ? (
@@ -132,17 +136,32 @@ export default function SettlementScreen() {
           <View style={styles.emptyIconContainer}>
             <CheckCircle size={48} color={theme.colors.success} />
           </View>
-          <Text style={styles.emptyTitle}>All settled up!</Text>
+          <Text style={styles.emptyTitle}>Everyone is settled up!</Text>
           <Text style={styles.emptySubtitle}>No pending payments</Text>
         </View>
       ) : (
-        <FlatList
-          data={pendingSettlements}
-          keyExtractor={(item) => item.id}
-          renderItem={renderSettlementItem}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-        />
+        <ScrollView contentContainerStyle={styles.listContent} showsVerticalScrollIndicator={false}>
+          {youOwe.length > 0 && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>You owe</Text>
+              {youOwe.map(renderSettlementItem)}
+            </View>
+          )}
+
+          {youWillReceive.length > 0 && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>You will receive</Text>
+              {youWillReceive.map(renderSettlementItem)}
+            </View>
+          )}
+
+          {suggestedSettlements.length > 0 && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Suggested settlements</Text>
+              {suggestedSettlements.map(renderSettlementItem)}
+            </View>
+          )}
+        </ScrollView>
       )}
     </View>
   );
@@ -178,6 +197,16 @@ const styles = StyleSheet.create({
   listContent: {
     paddingHorizontal: theme.spacing[24],
     paddingTop: theme.spacing[8],
+  },
+  section: {
+    marginBottom: theme.spacing[24],
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+    marginBottom: theme.spacing[12],
   },
   settlementCard: {
     flexDirection: 'row',

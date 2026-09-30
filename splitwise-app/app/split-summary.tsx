@@ -282,10 +282,10 @@ export default function SplitSummaryScreen() {
                           : styles.netTextZero,
                       ]}>
                       {friend.netAmount > 0
-                        ? `+₹${friend.netAmount.toFixed(2)}`
+                        ? `Gets back ₹${friend.netAmount.toFixed(2)}`
                         : friend.netAmount < 0
-                        ? `-₹${Math.abs(friend.netAmount).toFixed(2)}`
-                        : '₹0.00'}
+                        ? `Owes ₹${Math.abs(friend.netAmount).toFixed(2)}`
+                        : 'Settled'}
                     </Text>
                   </View>
                 </View>

@@ -5,3 +5,10 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Temporary build/debug artifacts
+javac_args.txt
+scratch_cp.txt
+scratch_args.txt
+sources.txt
+test_compile_args.txt
