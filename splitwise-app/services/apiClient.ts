@@ -81,8 +81,10 @@ apiClient.interceptors.response.use(
       try {
         await AsyncStorage.removeItem('authToken');
         await AsyncStorage.removeItem('userData');
-        // Redirect to login screen
-        router.replace('/(auth)/login');
+        // Notify AuthContext to clear memory state and redirect cleanly
+        import('react-native').then(({ DeviceEventEmitter }) => {
+          DeviceEventEmitter.emit('auth:logout');
+        });
       } catch (error) {
         console.error('Error clearing auth token:', error);
       }

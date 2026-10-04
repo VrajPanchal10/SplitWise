@@ -1,5 +1,5 @@
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack } from 'expo-router';
+import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import 'react-native-reanimated';
 import { ActivityIndicator, View } from 'react-native';
@@ -8,10 +8,6 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { AuthProvider, useAuth } from '../context/AuthContext';
 import { BillCreationProvider } from '../context/BillCreationContext';
 
-export const unstable_settings = {
-  anchor: '(tabs)',
-};
-
 import { useEffect } from 'react';
 import * as SplashScreen from 'expo-splash-screen';
 
@@ -19,8 +15,9 @@ import * as SplashScreen from 'expo-splash-screen';
 SplashScreen.preventAutoHideAsync();
 
 function RootLayoutContent() {
-  const colorScheme = useColorScheme();
   const { isLoading, isAuthenticated } = useAuth();
+  const segments = useSegments();
+  const router = useRouter();
 
   useEffect(() => {
     if (!isLoading) {
@@ -28,51 +25,42 @@ function RootLayoutContent() {
     }
   }, [isLoading]);
 
+  useEffect(() => {
+    if (isLoading) return;
+
+    const inAuthGroup = segments[0] === '(auth)';
+
+    if (!isAuthenticated && !inAuthGroup) {
+      router.replace('/(auth)/login');
+    } else if (isAuthenticated && inAuthGroup) {
+      router.replace('/(tabs)');
+    }
+  }, [isLoading, isAuthenticated, segments]);
+
+  // Keep rendering null until loading is complete to preserve the native splash screen.
+  // After loading, we render a single unified stack.
   if (isLoading) {
-    // Return null instead of ActivityIndicator so the native splash screen stays visible
     return null;
   }
 
-  // Conditional rendering based on auth state
-  if (isAuthenticated) {
-    return (
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="group/[id]" options={{ headerShown: false }} />
-        <Stack.Screen name="friend/[id]" options={{ headerShown: false }} />
-        <Stack.Screen name="bill/[id]" options={{ headerShown: false }} />
-        <Stack.Screen name="add-bill" options={{ headerShown: false }} />
-        <Stack.Screen name="manual-entry" options={{ headerShown: false }} />
-        <Stack.Screen name="edit-profile" options={{ headerShown: false }} />
-        <Stack.Screen name="scan-bill" options={{ headerShown: false }} />
-        <Stack.Screen name="select-expense-type" options={{ headerShown: false }} />
-        <Stack.Screen name="select-items" options={{ headerShown: false }} />
-        <Stack.Screen name="split-summary" options={{ headerShown: false }} />
-        <Stack.Screen name="settlement" options={{ headerShown: false }} />
-        <Stack.Screen name="add-group" options={{ headerShown: false }} />
-        <Stack.Screen name="qr-code" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', headerShown: false }} />
-      </Stack>
-    );
-  }
-
   return (
-    <Stack>
-      <Stack.Screen name="(auth)" options={{ headerShown: false }} />
-      <Stack.Screen name="group/[id]" options={{ headerShown: false }} />
-      <Stack.Screen name="friend/[id]" options={{ headerShown: false }} />
-      <Stack.Screen name="bill/[id]" options={{ headerShown: false }} />
-      <Stack.Screen name="add-bill" options={{ headerShown: false }} />
-      <Stack.Screen name="manual-entry" options={{ headerShown: false }} />
-      <Stack.Screen name="edit-profile" options={{ headerShown: false }} />
-      <Stack.Screen name="scan-bill" options={{ headerShown: false }} />
-      <Stack.Screen name="select-expense-type" options={{ headerShown: false }} />
-      <Stack.Screen name="select-items" options={{ headerShown: false }} />
-      <Stack.Screen name="split-summary" options={{ headerShown: false }} />
-      <Stack.Screen name="settlement" options={{ headerShown: false }} />
-      <Stack.Screen name="add-group" options={{ headerShown: false }} />
-      <Stack.Screen name="qr-code" options={{ headerShown: false }} />
-      <Stack.Screen name="modal" options={{ presentation: 'modal', headerShown: false }} />
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="(auth)" />
+      <Stack.Screen name="(tabs)" />
+      <Stack.Screen name="group/[id]" />
+      <Stack.Screen name="friend/[id]" />
+      <Stack.Screen name="bill/[id]" />
+      <Stack.Screen name="add-bill" />
+      <Stack.Screen name="manual-entry" />
+      <Stack.Screen name="edit-profile" />
+      <Stack.Screen name="scan-bill" />
+      <Stack.Screen name="select-expense-type" />
+      <Stack.Screen name="select-items" />
+      <Stack.Screen name="split-summary" />
+      <Stack.Screen name="settlement" />
+      <Stack.Screen name="add-group" />
+      <Stack.Screen name="qr-code" />
+      <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
     </Stack>
   );
 }

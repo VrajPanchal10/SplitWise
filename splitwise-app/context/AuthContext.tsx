@@ -47,6 +47,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       }
     };
     checkAuth();
+
+    // Listen for 401 unauthorized events from apiClient
+    const { DeviceEventEmitter } = require('react-native');
+    const subscription = DeviceEventEmitter.addListener('auth:logout', () => {
+      setUser(null);
+    });
+
+    return () => {
+      subscription.remove();
+    };
   }, []);
 
   const login = async (email: string, password: string) => {
@@ -120,13 +130,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       await AsyncStorage.removeItem('authToken');
       await AsyncStorage.removeItem('userData');
       
-      // Reset state
+      // Reset state. _layout.tsx will handle the redirect.
       setUser(null);
-      
-      // Navigate to login screen if router is provided
-      if (router) {
-        router.replace('/(auth)/login');
-      }
     } catch (error) {
       console.error('Logout error:', error);
       throw error;
