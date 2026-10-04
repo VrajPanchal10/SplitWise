@@ -4,6 +4,7 @@ import { ChevronLeft, Settings, Plus, ChevronDown, UtensilsCrossed, Car, Film, R
 import { theme } from '@/constants/theme';
 import { ZigzagEdge } from '@/components/ZigzagEdge';
 import { useRouter, useLocalSearchParams, useFocusEffect } from 'expo-router';
+import { CheckCircle2 } from 'lucide-react-native';
 import { useAuth } from '../../context/AuthContext';
 import apiClient from '../../services/apiClient';
 
@@ -291,23 +292,23 @@ export default function GroupDetailScreen() {
 
         {/* Balance Summary */}
         <View style={styles.heroBalance}>
-          <Text style={styles.balanceLabel}>Balance summary</Text>
+          <Text style={styles.balanceLabel}>Your group balance</Text>
           {youOweTotal - youAreOwedTotal > 0.005 ? (
             <Text style={[styles.balanceAmount, { color: theme.colors.danger }]}>
-              You owe ₹{(youOweTotal - youAreOwedTotal).toFixed(2)}
+              YOU OWE ₹{(youOweTotal - youAreOwedTotal).toFixed(2)}
             </Text>
           ) : youAreOwedTotal - youOweTotal > 0.005 ? (
             <Text style={[styles.balanceAmount, { color: theme.colors.success }]}>
-              You are owed ₹{(youAreOwedTotal - youOweTotal).toFixed(2)}
+              YOU WILL RECEIVE ₹{(youAreOwedTotal - youOweTotal).toFixed(2)}
             </Text>
           ) : (
-            <Text style={[styles.balanceAmount, { color: theme.colors.cream }]}>
-              All settled up
-            </Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <CheckCircle2 size={24} color={theme.colors.success} />
+              <Text style={[styles.balanceAmount, { color: theme.colors.success, marginBottom: 0 }]}>
+                Settled
+              </Text>
+            </View>
           )}
-          <Text style={styles.balanceSubtitle}>
-            Total bills: ₹{totalBills.toLocaleString()}
-          </Text>
         </View>
 
         {/* Zigzag Edge */}
@@ -346,17 +347,18 @@ export default function GroupDetailScreen() {
                 settlementItems.map((item, index) => (
                   <View key={`${item.otherId}-${item.direction}`}>
                     <View style={styles.settlementRow}>
-                      <Text style={styles.settlementText}>
-                        {item.direction === 'owe' ? (
-                          <>
-                            You owe <Text style={styles.settlementPersonName}>{item.otherName}</Text>
-                          </>
-                        ) : (
-                          <>
-                            <Text style={styles.settlementPersonName}>{item.otherName}</Text> owes you
-                          </>
-                        )}
-                      </Text>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.settlementText}>
+                          {item.direction === 'owe' ? (
+                            <>You → <Text style={styles.settlementPersonName}>{item.otherName}</Text></>
+                          ) : (
+                            <><Text style={styles.settlementPersonName}>{item.otherName}</Text> → You</>
+                          )}
+                        </Text>
+                        <Text style={{ fontSize: 12, color: theme.colors.textSecondary, marginTop: 4 }}>
+                          Simplified debt from all group expenses
+                        </Text>
+                      </View>
                       <Text
                         style={[
                           styles.settlementAmount,

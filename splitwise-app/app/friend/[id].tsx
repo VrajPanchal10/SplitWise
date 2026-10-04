@@ -76,10 +76,10 @@ const BillRow: React.FC<{ bill: BillWithShare; friendName: string }> = ({ bill, 
 
   const getShareLabel = () => {
     if (bill.direction === 'owe') {
-      return `You owe ${friendName} ₹${bill.shareAmount.toFixed(2)}`;
+      return `You owe ₹${bill.shareAmount.toFixed(2)}`;
     }
     if (bill.direction === 'owed') {
-      return `${friendName} owes you ₹${bill.shareAmount.toFixed(2)}`;
+      return `${friendName} owes ₹${bill.shareAmount.toFixed(2)}`;
     }
     return 'Settled up';
   };
@@ -125,6 +125,7 @@ export default function FriendDetailScreen() {
   const [bills, setBills] = useState<BillWithShare[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSettling, setIsSettling] = useState(false);
+  const [settleModalVisible, setSettleModalVisible] = useState(false);
 
   const fetchFriendData = useCallback(async () => {
     if (!friendId || !user) return;
@@ -209,40 +210,25 @@ export default function FriendDetailScreen() {
 
   const handleSettleUp = () => {
     if (netBalance === null || Math.abs(netBalance) <= 0.005) return;
+    setSettleModalVisible(true);
+  };
 
-    const amount = Math.abs(netBalance);
-    const isOwing = netBalance < 0;
-
-    Alert.alert(
-      'Settle Up',
-      isOwing
-        ? `Mark ₹${amount.toFixed(2)} as paid to ${friendName}?`
-        : `Mark ₹${amount.toFixed(2)} as received from ${friendName}?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Confirm',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              setIsSettling(true);
-              await apiClient.post(`/settlements/settle-with-friend/${friendId}`);
-              Alert.alert('Success', `You're all settled up with ${friendName}!`);
-              // Refresh data to reflect the new settled state
-              fetchFriendData();
-            } catch (error: any) {
-              console.error('Error settling up:', error);
-              Alert.alert(
-                'Error',
-                error.response?.data?.message || 'Failed to settle up. Please try again.'
-              );
-            } finally {
-              setIsSettling(false);
-            }
-          },
-        },
-      ]
-    );
+  const handleConfirmSettle = async () => {
+    try {
+      setIsSettling(true);
+      await apiClient.post(`/settlements/settle-with-friend/${friendId}`);
+      setSettleModalVisible(false);
+      // Refresh data to reflect the new settled state
+      fetchFriendData();
+    } catch (error: any) {
+      console.error('Error settling up:', error);
+      Alert.alert(
+        'Error',
+        error.response?.data?.message || 'Failed to settle up. Please try again.'
+      );
+    } finally {
+      setIsSettling(false);
+    }
   };
 
   const handleSendReminder = () => {
@@ -259,9 +245,9 @@ export default function FriendDetailScreen() {
 
   const getBalanceText = () => {
     if (netBalance === null) return 'Loading...';
-    if (netBalance > 0.005) return `${friendName} owes you ₹${netBalance.toFixed(2)}`;
-    if (netBalance < -0.005) return `You owe ${friendName} ₹${Math.abs(netBalance).toFixed(2)}`;
-    return "You're settled up";
+    if (netBalance > 0.005) return `${friendName} → You`;
+    if (netBalance < -0.005) return `You → ${friendName}`;
+    return "All shared expenses are settled.";
   };
 
   const getBalanceColor = () => {
@@ -289,10 +275,23 @@ export default function FriendDetailScreen() {
 
         {/* Balance Summary */}
         <View style={styles.heroBalance}>
-          <Text style={styles.balanceLabel}>Net balance</Text>
-          <Text style={[styles.balanceAmount, { color: getBalanceColor() }]}>
-            {getBalanceText()}
-          </Text>
+          {netBalance !== null && Math.abs(netBalance) <= 0.005 ? (
+            <View style={{ alignItems: 'center', gap: 4 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <CheckCircle2 size={24} color={theme.colors.success} />
+                <Text style={[styles.balanceAmount, { color: theme.colors.success }]}>Settled</Text>
+              </View>
+              <Text style={[styles.balanceAmount, { color: theme.colors.cream, fontSize: 20 }]}>₹0</Text>
+              <Text style={styles.balanceLabel}>All shared expenses are settled.</Text>
+            </View>
+          ) : (
+            <View style={{ alignItems: 'center' }}>
+              <Text style={styles.balanceLabel}>{getBalanceText()}</Text>
+              <Text style={[styles.balanceAmount, { color: getBalanceColor() }]}>
+                {netBalance !== null ? `₹${Math.abs(netBalance).toFixed(2)}` : ''}
+              </Text>
+            </View>
+          )}
         </View>
 
         {/* Action Buttons */}
@@ -336,7 +335,13 @@ export default function FriendDetailScreen() {
           showsVerticalScrollIndicator={false}
           ItemSeparatorComponent={() => <View style={styles.billSeparator} />}
           ListHeaderComponent={
-            <Text style={styles.sectionTitle}>Shared expenses</Text>
+            <Text style={styles.sectionTitle}>
+              {netBalance !== null && Math.abs(netBalance) > 0.005
+                ? netBalance > 0
+                  ? `Why ${friendName} owes you`
+                  : `Why you owe ${friendName}`
+                : 'Shared expenses'}
+            </Text>
           }
         />
       ) : (
@@ -346,6 +351,51 @@ export default function FriendDetailScreen() {
           </View>
           <Text style={styles.emptyText}>No shared expenses yet</Text>
         </View>
+      )}
+
+      {/* Settle Up Modal */}
+      {netBalance !== null && (
+        <Modal
+          visible={settleModalVisible}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setSettleModalVisible(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>Record settlement</Text>
+              
+              <View style={styles.modalBody}>
+                <Text style={styles.modalDirectionText}>
+                  {netBalance < 0 ? `You pay ${friendName}` : `${friendName} pays you`}
+                </Text>
+                <Text style={styles.modalAmountText}>₹{Math.abs(netBalance).toFixed(2)}</Text>
+              </View>
+
+              <Text style={styles.modalSubtitle}>
+                This payment will clear the current ₹{Math.abs(netBalance).toFixed(2)} balance created by your shared expenses.
+              </Text>
+
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={styles.modalCancelButton}
+                  onPress={() => setSettleModalVisible(false)}>
+                  <Text style={styles.modalCancelText}>CANCEL</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.modalConfirmButton}
+                  onPress={handleConfirmSettle}>
+                  {isSettling ? (
+                    <ActivityIndicator size="small" color={theme.colors.heroBg} />
+                  ) : (
+                    <Text style={styles.modalConfirmText}>
+                      CONFIRM ₹{Math.abs(netBalance).toFixed(2)} {netBalance < 0 ? 'PAID' : 'RECEIVED'}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
       )}
     </View>
   );
@@ -537,6 +587,80 @@ const styles = StyleSheet.create({
   emptyText: {
     fontSize: 16,
     color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalOverlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  modalContent: {
+    width: '85%',
+    backgroundColor: theme.colors.surface,
+    borderRadius: 16,
+    padding: theme.spacing[24],
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+    marginBottom: theme.spacing[24],
+    textAlign: 'center',
+  },
+  modalBody: {
+    alignItems: 'center',
+    marginBottom: theme.spacing[16],
+    gap: theme.spacing[4],
+  },
+  modalDirectionText: {
+    fontSize: 16,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalAmountText: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  modalSubtitle: {
+    fontSize: 14,
+    color: theme.colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: theme.spacing[32],
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalActions: {
+    gap: theme.spacing[12],
+  },
+  modalConfirmButton: {
+    backgroundColor: theme.colors.success,
+    height: 48,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalConfirmText: {
+    color: theme.colors.cream,
+    fontSize: 14,
+    fontWeight: '600',
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalCancelButton: {
+    height: 48,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  modalCancelText: {
+    color: theme.colors.textPrimary,
+    fontSize: 14,
+    fontWeight: '500',
     fontFamily: theme.fontFamily.regular,
   },
 });
