@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, ActivityIndicator, TextInput, Image } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, ActivityIndicator, TextInput, Image, DeviceEventEmitter } from 'react-native';
 import { ChevronLeft, ArrowRight } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
 import { useRouter } from 'expo-router';
@@ -12,6 +12,12 @@ import {
   validateCustomShares,
   type ParticipantBreakdown,
 } from '../utils/splitCalculator';
+import {
+  SUPPORTED_CURRENCIES,
+  getCurrencySymbol,
+  formatMoney,
+  getApproximateRate,
+} from '@/constants/currencies';
 
 interface FriendShare {
   userId: string;
@@ -32,7 +38,7 @@ interface Settlement {
 
 export default function SplitSummaryScreen() {
   const router = useRouter();
-  const { scannedItems, groupId, receiptUrl, resetBill } = useBillCreation();
+  const { scannedItems, groupId, currency = 'INR', receiptUrl, resetBill } = useBillCreation();
   const { user } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
   const [friendShares, setFriendShares] = useState<FriendShare[]>([]);
@@ -178,15 +184,19 @@ export default function SplitSummaryScreen() {
       }));
 
       // Create bill via API
-      await apiClient.post('/bills', {
+      const response = await apiClient.post('/bills', {
         title: `Bill ${new Date().toLocaleDateString()}`,
         totalAmount: Math.round(total * 100) / 100,
+        currency: currency || 'INR',
         groupId: groupId || null,
         paidBy: user.id,
         participantIds: undefined,
         items: billItems,
         receiptUrl: receiptUrl || null,
       });
+
+      // Emit bill:created event for immediate state updates
+      DeviceEventEmitter.emit('bill:created', { groupId, bill: response.data });
 
       // Reset bill creation state
       resetBill();
@@ -226,7 +236,12 @@ export default function SplitSummaryScreen() {
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Expense Breakdown</Text>
           <Text style={styles.totalLabel}>Total Amount</Text>
-          <Text style={styles.totalAmount}>₹{totalAmount.toFixed(2)}</Text>
+          <Text style={styles.totalAmount}>{formatMoney(totalAmount, currency, true)}</Text>
+          {currency && currency.toUpperCase() !== 'INR' && (
+            <Text style={styles.convertedTotalAmount}>
+              ≈ {formatMoney(totalAmount * getApproximateRate(currency, 'INR'), 'INR', true)}
+            </Text>
+          )}
           <Text style={styles.paidByLabel}>
             Paid by You · {friendShares.length} participant{friendShares.length !== 1 ? 's' : ''}
           </Text>
@@ -248,12 +263,12 @@ export default function SplitSummaryScreen() {
                     {friend.name} {friend.userId === user?.id ? '(Payer)' : ''}
                   </Text>
                   <Text style={styles.friendPaidLabel}>
-                    Paid: ₹{friend.paidAmount.toFixed(2)}
+                    Paid: {formatMoney(friend.paidAmount, currency)}
                   </Text>
                 </View>
                 <View style={styles.shareColumn}>
                   <View style={styles.amountInputContainer}>
-                    <Text style={styles.currencySymbol}>₹</Text>
+                    <Text style={styles.currencySymbol}>{getCurrencySymbol(currency)}</Text>
                     <TextInput
                       style={styles.amountInput}
                       value={editingAmounts[friend.userId] || ''}
@@ -282,9 +297,9 @@ export default function SplitSummaryScreen() {
                           : styles.netTextZero,
                       ]}>
                       {friend.netAmount > 0
-                        ? `Gets back ₹${friend.netAmount.toFixed(2)}`
+                        ? `Gets back ${formatMoney(friend.netAmount, currency)}`
                         : friend.netAmount < 0
-                        ? `Owes ₹${Math.abs(friend.netAmount).toFixed(2)}`
+                        ? `Owes ${formatMoney(Math.abs(friend.netAmount), currency)}`
                         : 'Settled'}
                     </Text>
                   </View>
@@ -317,7 +332,7 @@ export default function SplitSummaryScreen() {
                     : styles.validationBarTextDanger,
                 ]}>
                 {sharesValidation.isValid
-                  ? `✓ Shares reconcile to ₹${sharesValidation.sum.toFixed(2)}`
+                  ? `✓ Shares reconcile to ${formatMoney(sharesValidation.sum, currency)}`
                   : sharesValidation.message}
               </Text>
             </View>
@@ -362,7 +377,22 @@ export default function SplitSummaryScreen() {
                       <Text style={styles.settlementName}>{settlement.to}</Text>
                     </View>
 
-                    <Text style={styles.settlementAmount}>₹{settlement.amount.toFixed(2)}</Text>
+                    <View style={{ alignItems: 'flex-end' }}>
+                      <Text style={styles.settlementAmount}>
+                        {formatMoney(
+                          currency && currency.toUpperCase() !== 'INR'
+                            ? Math.round(settlement.amount * getApproximateRate(currency, 'INR') * 100) / 100
+                            : settlement.amount,
+                          'INR',
+                          true
+                        )}
+                      </Text>
+                      {currency && currency.toUpperCase() !== 'INR' && (
+                        <Text style={styles.settlementSubAmount}>
+                          ({formatMoney(settlement.amount, currency)})
+                        </Text>
+                      )}
+                    </View>
                   </View>
                   {index < settlements.length - 1 && <View style={styles.rowDivider} />}
                 </View>
@@ -446,6 +476,13 @@ const styles = StyleSheet.create({
     color: theme.colors.textPrimary,
     fontFamily: theme.fontFamily.mono,
     marginBottom: theme.spacing[4],
+  },
+  convertedTotalAmount: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.mono,
+    marginBottom: theme.spacing[8],
   },
   paidByLabel: {
     fontSize: 12,
@@ -594,6 +631,12 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: theme.colors.success,
     fontFamily: theme.fontFamily.mono,
+  },
+  settlementSubAmount: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.mono,
+    marginTop: 2,
   },
   bottomBar: {
     backgroundColor: theme.colors.surface,

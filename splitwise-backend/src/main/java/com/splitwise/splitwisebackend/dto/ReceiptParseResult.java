@@ -20,6 +20,8 @@ public class ReceiptParseResult {
     private Double totalAmount;
     /** LOW, MEDIUM, or HIGH - how confident we are in the parsed values. */
     private String confidence = "LOW";
+    /** Detected currency code (e.g., USD, INR, EUR, GBP). Defaults to INR if undetermined. */
+    private String currency = "INR";
 
     // --- Financial breakdown fields ---
     private Double subtotal;
@@ -28,7 +30,21 @@ public class ReceiptParseResult {
     private Double sgst;
     private Double tax;
     private Double serviceCharge;
+    private Double tip;
     private Double roundOff;
+    private Double amountPaid;
+    private Double change;
+
+    // --- Validation and Confidence Details ---
+    /** VALIDATED, PARTIALLY_VALIDATED, UNVERIFIED, or FAILED_VALIDATION */
+    private String validationStatus = "UNVERIFIED";
+    /** Human-readable explanation of the validation result */
+    private String validationMessage;
+    /** OCR text recognition confidence (HIGH, MEDIUM, LOW) */
+    private String ocrConfidence = "LOW";
+    /** Semantic parsing confidence (HIGH, MEDIUM, LOW) */
+    private String parsingConfidence = "LOW";
+
     /** The raw OCR text, preserved for debugging/manual review. */
     private String rawText;
 }

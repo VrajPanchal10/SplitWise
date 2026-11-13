@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, TextInput, FlatList, ActivityIndicator, Image } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, TextInput, FlatList, ActivityIndicator, Image, DeviceEventEmitter } from 'react-native';
 import { ChevronLeft, Users, Search, X, Plus, User } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
 import { useRouter } from 'expo-router';
@@ -67,10 +67,12 @@ export default function AddGroupScreen() {
 
     try {
       // Create group with selected members
-      await apiClient.post('/groups', {
+      const response = await apiClient.post('/groups', {
         name: groupName.trim(),
         memberIds: members.map(m => m.id)
       });
+
+      DeviceEventEmitter.emit('group:created', { group: response?.data });
 
       // Navigate back to groups tab
       router.replace('/(tabs)/groups');

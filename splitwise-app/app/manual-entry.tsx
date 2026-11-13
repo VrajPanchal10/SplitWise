@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, TextInput, ScrollView, ActivityIndicator, Alert, Image } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, TextInput, ScrollView, ActivityIndicator, Alert, Image, DeviceEventEmitter } from 'react-native';
 import { ChevronLeft, Check, ChevronDown, ChevronUp, AlertTriangle, Edit3 } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
 import { useRouter, useLocalSearchParams } from 'expo-router';
@@ -11,6 +11,16 @@ import {
   calculateBillBreakdown,
   validateCustomShares,
 } from '../utils/splitCalculator';
+import {
+  SUPPORTED_CURRENCIES,
+  getCurrencyConfig,
+  getCurrencySymbol,
+  getApproximateRate,
+  formatMoney,
+  formatDualCurrency,
+} from '@/constants/currencies';
+import { CurrencyPickerModal } from '@/components/CurrencyPickerModal';
+import { EXPENSE_CATEGORIES, getCategoryByKey } from '@/constants/categories';
 
 interface Friend {
   id: string;
@@ -35,6 +45,7 @@ export default function ManualEntryScreen() {
   const billId = params.billId as string | undefined;
   const scannedTitle = params.scannedTitle as string | undefined;
   const scannedAmount = params.scannedAmount as string | undefined;
+  const scannedCurrency = (params.currency as string | undefined) || 'INR';
   const receiptUrl = params.receiptUrl as string | undefined;
   const ocrConfidence = params.ocrConfidence as string | undefined;
   const ocrFinancialsRaw = params.ocrFinancials as string | undefined;
@@ -43,6 +54,9 @@ export default function ManualEntryScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [title, setTitle] = useState(scannedTitle || '');
   const [amount, setAmount] = useState(scannedAmount || '');
+  const [currency, setCurrency] = useState<string>(scannedCurrency.toUpperCase().trim());
+  const [isCurrencyModalVisible, setIsCurrencyModalVisible] = useState(false);
+  const [groupBaseCurrency, setGroupBaseCurrency] = useState<string>('INR');
   const [description, setDescription] = useState('');
   const [friends, setFriends] = useState<Friend[]>([]);
   const [selectedFriendIds, setSelectedFriendIds] = useState<string[]>([]);
@@ -52,6 +66,7 @@ export default function ManualEntryScreen() {
   const [titleError, setTitleError] = useState('');
   const [amountError, setAmountError] = useState('');
   const [participantError, setParticipantError] = useState('');
+  const [category, setCategory] = useState('Other');
 
   // Split mode: equal vs unequal/custom
   const [splitMode, setSplitMode] = useState<'equal' | 'unequal'>('equal');
@@ -121,6 +136,15 @@ export default function ManualEntryScreen() {
 
       setTitle(bill.title || '');
       setAmount(bill.totalAmount ? String(bill.totalAmount) : '');
+      if (bill.currency) {
+        setCurrency(bill.currency.toUpperCase().trim());
+      }
+      if (bill.baseCurrency) {
+        setGroupBaseCurrency(bill.baseCurrency.toUpperCase().trim());
+      }
+      if (bill.category) {
+        setCategory(bill.category);
+      }
 
       // Collect all unique participant IDs from items
       const participantIds = new Set<string>();
@@ -154,10 +178,20 @@ export default function ManualEntryScreen() {
     
     try {
       setIsLoadingFriends(true);
-      const response = await apiClient.get(`/groups/${groupId}/members`);
-      const members = response.data;
+      const [membersResponse, groupResponse] = await Promise.all([
+        apiClient.get(`/groups/${groupId}/members`),
+        apiClient.get(`/groups/${groupId}`).catch(() => null),
+      ]);
+      const members = membersResponse.data;
       setFriends(members);
       setSelectedFriendIds(members.map((m: Friend) => m.id));
+      if (groupResponse?.data?.defaultCurrency) {
+        const gCurr = groupResponse.data.defaultCurrency.toUpperCase().trim();
+        if (!params.currency && !scannedCurrency) {
+          setCurrency(gCurr);
+        }
+      }
+      setGroupBaseCurrency('INR');
     } catch (error) {
       console.error('Error fetching group members:', error);
     } finally {
@@ -259,10 +293,18 @@ export default function ManualEntryScreen() {
     setAmount(String(Math.round(sum * 100) / 100));
   };
 
-  // Active participants list (payer/current user + selected friends)
+  const isGroupMode = !!groupId;
+
+  // Active participants list
+  // In group mode, all group members (including the user) are in the selection list.
+  // The user can select any subset (e.g. only Nidhi, 2 participants, or all 4).
+  // In direct friends mode (outside a group), user is always included with selected friends.
   const activeParticipantIds = useMemo(() => {
+    if (isGroupMode) {
+      return Array.from(new Set(selectedFriendIds.filter(Boolean) as string[]));
+    }
     return Array.from(new Set([user?.id, ...selectedFriendIds].filter(Boolean) as string[]));
-  }, [user?.id, selectedFriendIds]);
+  }, [isGroupMode, user?.id, selectedFriendIds]);
 
   const getParticipantName = (uid: string) => {
     if (uid === user?.id) return 'You';
@@ -308,8 +350,8 @@ export default function ManualEntryScreen() {
     for (const uid of activeParticipantIds) {
       numericShares[uid] = parseFloat(customShares[uid] || '0') || 0;
     }
-    return validateCustomShares(numericShares, total);
-  }, [splitMode, amount, activeParticipantIds, customShares]);
+    return validateCustomShares(numericShares, total, getCurrencySymbol(currency));
+  }, [splitMode, amount, activeParticipantIds, customShares, currency]);
 
   // Live breakdown computation for UI preview
   const liveBreakdown = useMemo(() => {
@@ -386,11 +428,38 @@ export default function ManualEntryScreen() {
           }
         ];
       } else if (ocrItems.length > 0) {
-        items = ocrItems.map(item => ({
-          name: item.name,
-          price: item.price,
-          sharedByUserIds,
-        }));
+        const itemsSum = ocrItems.reduce((s, i) => s + (i.price || 0), 0);
+        const diff = Math.round((totalAmount - itemsSum) * 100) / 100;
+        if (diff > 0.05) {
+          // Extra charges/tax exist on receipt not represented as separate items
+          items = [
+            ...ocrItems.map((item) => ({
+              name: item.name,
+              price: item.price,
+              sharedByUserIds,
+            })),
+            {
+              name: 'Taxes, Tips & Other Charges',
+              price: diff,
+              sharedByUserIds,
+            },
+          ];
+        } else if (diff < -0.05) {
+          // Items sum exceeds total (e.g. discount applied to total), represent as unified bill item
+          items = [
+            {
+              name: title.trim(),
+              price: totalAmount,
+              sharedByUserIds,
+            },
+          ];
+        } else {
+          items = ocrItems.map((item) => ({
+            name: item.name,
+            price: item.price,
+            sharedByUserIds,
+          }));
+        }
       } else {
         items = [
           {
@@ -406,6 +475,9 @@ export default function ManualEntryScreen() {
         totalAmount: totalAmount,
         paidBy: user.id,
         items,
+        currency: currency.toUpperCase().trim(),
+        baseCurrency: 'INR',
+        category,
       };
 
       if (receiptUrl) {
@@ -422,17 +494,20 @@ export default function ManualEntryScreen() {
 
       if (isEditMode && billId) {
         // Update existing bill
-        await apiClient.put(`/bills/${billId}`, billData);
+        const response = await apiClient.put(`/bills/${billId}`, billData);
+        DeviceEventEmitter.emit('bill:updated', { groupId, bill: response.data || billData });
         router.back();
       } else {
         // Create new bill
-        await apiClient.post('/bills', billData);
+        const response = await apiClient.post('/bills', billData);
+        const createdBill = response.data;
+        DeviceEventEmitter.emit('bill:created', { groupId, bill: createdBill });
 
         if (groupId) {
-          // Navigate back to group detail screen (will refetch bills on focus)
+          // Navigate back to group detail screen
           router.replace({ pathname: '/group/[id]', params: { id: groupId } });
         } else {
-          // Navigate to Dashboard (will refetch on focus)
+          // Navigate to Dashboard
           router.replace('/(tabs)');
         }
       }
@@ -451,8 +526,6 @@ export default function ManualEntryScreen() {
     day: 'numeric'
   });
 
-  // Determine if we're in group mode
-  const isGroupMode = groupId !== undefined;
 
   const getConfidenceColor = () => {
     switch (ocrConfidence) {
@@ -504,9 +577,25 @@ export default function ManualEntryScreen() {
           </View>
 
           <View style={styles.inputContainer}>
-            <Text style={styles.inputLabel}>Amount *</Text>
+            <View style={styles.inputLabelRow}>
+              <Text style={styles.inputLabel}>Amount *</Text>
+              {currency !== groupBaseCurrency && (
+                <Text style={styles.baseCurrencyBadge}>
+                  Base: {groupBaseCurrency}
+                </Text>
+              )}
+            </View>
             <View style={styles.amountInputContainer}>
-              <Text style={styles.currencySymbol}>₹</Text>
+              <TouchableOpacity
+                style={styles.currencySelectorPill}
+                onPress={() => setIsCurrencyModalVisible(true)}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.currencyFlagText}>{getCurrencyConfig(currency).flag}</Text>
+                <Text style={styles.currencySelectorCode}>{currency}</Text>
+                <Text style={styles.currencySelectorSymbol}>({getCurrencySymbol(currency)})</Text>
+                <ChevronDown size={14} color={theme.colors.textSecondary} />
+              </TouchableOpacity>
               <TextInput
                 style={[styles.amountInput, amountError && styles.amountInputError]}
                 value={amount}
@@ -516,6 +605,16 @@ export default function ManualEntryScreen() {
                 keyboardType="numeric"
               />
             </View>
+            {currency !== groupBaseCurrency && parseFloat(amount) > 0 ? (
+              <View style={styles.conversionPreviewCard}>
+                <Text style={styles.conversionPreviewText}>
+                  ≈ {formatMoney(parseFloat(amount) * getApproximateRate(currency, groupBaseCurrency), groupBaseCurrency, true)}
+                </Text>
+                <Text style={styles.conversionRateText}>
+                  (1 {currency} = {getApproximateRate(currency, groupBaseCurrency)} {groupBaseCurrency})
+                </Text>
+              </View>
+            ) : null}
             {amountError ? <Text style={styles.errorText}>{amountError}</Text> : null}
           </View>
 
@@ -530,6 +629,37 @@ export default function ManualEntryScreen() {
               multiline
               numberOfLines={3}
             />
+          </View>
+
+          {/* Category Picker */}
+          <View style={styles.inputContainer}>
+            <Text style={styles.inputLabel}>Category</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryScroll}>
+              {EXPENSE_CATEGORIES.map((cat) => {
+                const isSelected = category === cat.key;
+                return (
+                  <TouchableOpacity
+                    key={cat.key}
+                    style={[
+                      styles.categoryChip,
+                      isSelected && { backgroundColor: cat.tint, borderColor: cat.color },
+                    ]}
+                    onPress={() => setCategory(cat.key)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.categoryChipEmoji}>{cat.emoji}</Text>
+                    <Text
+                      style={[
+                        styles.categoryChipText,
+                        isSelected && { color: cat.color, fontWeight: '700' },
+                      ]}
+                    >
+                      {cat.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
           </View>
 
           <View style={styles.inputContainer}>
@@ -617,12 +747,12 @@ export default function ManualEntryScreen() {
                           {item.quantity !== null && (
                             <Text style={styles.ocrItemQty}>
                               Qty: {item.quantity}
-                              {item.unitPrice !== null ? ` × ₹${item.unitPrice}` : ''}
+                              {item.unitPrice !== null ? ` × ${getCurrencySymbol(currency)}${item.unitPrice}` : ''}
                             </Text>
                           )}
                         </View>
                         <View style={styles.ocrItemRight}>
-                          <Text style={styles.ocrItemPrice}>₹{item.price}</Text>
+                          <Text style={styles.ocrItemPrice}>{getCurrencySymbol(currency)}{item.price}</Text>
                           <Edit3 size={14} color={theme.colors.textSecondary} />
                         </View>
                       </TouchableOpacity>
@@ -635,7 +765,7 @@ export default function ManualEntryScreen() {
                   style={styles.recalcButton}
                   onPress={recalculateTotalFromItems}>
                   <Text style={styles.recalcButtonText}>
-                    Use item total (₹{Math.round(ocrItems.reduce((s, i) => s + (i.price || 0), 0) * 100) / 100})
+                    Use item total ({formatMoney(Math.round(ocrItems.reduce((s, i) => s + (i.price || 0), 0) * 100) / 100, currency)})
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -650,45 +780,45 @@ export default function ManualEntryScreen() {
             {ocrFinancials.subtotal && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>Subtotal</Text>
-                <Text style={styles.financialValue}>₹{ocrFinancials.subtotal}</Text>
+                <Text style={styles.financialValue}>{getCurrencySymbol(currency)}{ocrFinancials.subtotal}</Text>
               </View>
             )}
             {ocrFinancials.cgst && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>CGST</Text>
-                <Text style={styles.financialValue}>₹{ocrFinancials.cgst}</Text>
+                <Text style={styles.financialValue}>{getCurrencySymbol(currency)}{ocrFinancials.cgst}</Text>
               </View>
             )}
             {ocrFinancials.sgst && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>SGST</Text>
-                <Text style={styles.financialValue}>₹{ocrFinancials.sgst}</Text>
+                <Text style={styles.financialValue}>{getCurrencySymbol(currency)}{ocrFinancials.sgst}</Text>
               </View>
             )}
             {ocrFinancials.tax && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>Tax</Text>
-                <Text style={styles.financialValue}>₹{ocrFinancials.tax}</Text>
+                <Text style={styles.financialValue}>{getCurrencySymbol(currency)}{ocrFinancials.tax}</Text>
               </View>
             )}
             {ocrFinancials.serviceCharge && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>Service Charge</Text>
-                <Text style={styles.financialValue}>₹{ocrFinancials.serviceCharge}</Text>
+                <Text style={styles.financialValue}>{getCurrencySymbol(currency)}{ocrFinancials.serviceCharge}</Text>
               </View>
             )}
             {ocrFinancials.discount && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>Discount</Text>
                 <Text style={[styles.financialValue, { color: theme.colors.success }]}>
-                  -₹{Math.abs(ocrFinancials.discount)}
+                  -{getCurrencySymbol(currency)}{Math.abs(ocrFinancials.discount)}
                 </Text>
               </View>
             )}
             {ocrFinancials.roundOff && (
               <View style={styles.financialRow}>
                 <Text style={styles.financialLabel}>Round Off</Text>
-                <Text style={styles.financialValue}>₹{ocrFinancials.roundOff}</Text>
+                <Text style={styles.financialValue}>{getCurrencySymbol(currency)}{ocrFinancials.roundOff}</Text>
               </View>
             )}
           </View>
@@ -871,7 +1001,7 @@ export default function ManualEntryScreen() {
                       </Text>
                     </View>
                     <View style={styles.customShareInputWrap}>
-                      <Text style={styles.currencySymbolSmall}>₹</Text>
+                      <Text style={styles.currencySymbolSmall}>{getCurrencySymbol(currency)}</Text>
                       <TextInput
                         style={styles.customShareInput}
                         value={customShares[uid] || ''}
@@ -904,7 +1034,7 @@ export default function ManualEntryScreen() {
                         : styles.validationTextDanger,
                     ]}>
                     {customValidation.isValid
-                      ? `✓ Shares match bill total (₹${customValidation.sum.toFixed(2)})`
+                      ? `✓ Shares match bill total (${formatMoney(customValidation.sum, currency)})`
                       : customValidation.message}
                   </Text>
                 </View>
@@ -926,7 +1056,7 @@ export default function ManualEntryScreen() {
                 <View style={styles.breakdownSummaryBar}>
                   <View style={styles.summaryPill}>
                     <Text style={styles.summaryPillLabel}>Total Bill</Text>
-                    <Text style={styles.summaryPillValue}>₹{liveBreakdown.totalAmount.toFixed(2)}</Text>
+                    <Text style={styles.summaryPillValue}>{formatMoney(liveBreakdown.totalAmount, currency)}</Text>
                   </View>
                   <View style={styles.summaryPillDivider} />
                   <View style={styles.summaryPill}>
@@ -966,7 +1096,7 @@ export default function ManualEntryScreen() {
                                 {pName} {isPayer ? '(Payer)' : ''}
                               </Text>
                               <Text style={styles.breakdownMetaText}>
-                                Paid: ₹{p.paidAmount.toFixed(2)} · Share: ₹{p.shareAmount.toFixed(2)}
+                                Paid: {formatMoney(p.paidAmount, currency)} · Share: {formatMoney(p.shareAmount, currency)}
                               </Text>
                             </View>
                           </View>
@@ -990,14 +1120,19 @@ export default function ManualEntryScreen() {
                                   : styles.netTextZero,
                               ]}>
                               {p.netAmount > 0
-                                ? `+₹${p.netAmount.toFixed(2)}`
+                                ? `+${formatMoney(p.netAmount, currency)}`
                                 : p.netAmount < 0
-                                ? `-₹${Math.abs(p.netAmount).toFixed(2)}`
-                                : '₹0.00'}
+                                ? `-${formatMoney(Math.abs(p.netAmount), currency)}`
+                                : formatMoney(0, currency)}
                             </Text>
                             <Text style={styles.netSubText}>
                               {p.netAmount > 0 ? 'receives' : p.netAmount < 0 ? 'owes' : 'settled'}
                             </Text>
+                            {currency !== groupBaseCurrency && (
+                              <Text style={styles.netConvertedSubText}>
+                                ≈ {formatMoney(p.netAmount * getApproximateRate(currency, groupBaseCurrency), groupBaseCurrency)}
+                              </Text>
+                            )}
                           </View>
                         </View>
                         {idx < liveBreakdown.participants.length - 1 && (
@@ -1025,6 +1160,17 @@ export default function ManualEntryScreen() {
           </TouchableOpacity>
         </View>
       </ScrollView>
+
+      {/* Currency Picker Modal */}
+      <CurrencyPickerModal
+        visible={isCurrencyModalVisible}
+        selectedCurrency={currency}
+        onSelect={(newCurrency) => {
+          setCurrency(newCurrency);
+          setIsCurrencyModalVisible(false);
+        }}
+        onClose={() => setIsCurrencyModalVisible(false)}
+      />
     </View>
   );
 }
@@ -1796,5 +1942,99 @@ const styles = StyleSheet.create({
     height: 1,
     backgroundColor: theme.colors.border,
     marginVertical: 4,
+  },
+  inputLabelRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.spacing[8],
+  },
+  baseCurrencyBadge: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: theme.colors.primary,
+    backgroundColor: '#E8F5E9',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 6,
+    fontFamily: theme.fontFamily.regular,
+  },
+  currencySelectorPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F3F4F6',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    marginRight: 10,
+    gap: 4,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  currencyFlagText: {
+    fontSize: 16,
+  },
+  currencySelectorCode: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  currencySelectorSymbol: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  conversionPreviewCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F0FDF4',
+    borderWidth: 1,
+    borderColor: '#BBF7D0',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginTop: 8,
+  },
+  conversionPreviewText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#166534',
+    fontFamily: theme.fontFamily.regular,
+  },
+  conversionRateText: {
+    fontSize: 11,
+    color: '#15803D',
+    fontFamily: theme.fontFamily.mono,
+  },
+  netConvertedSubText: {
+    fontSize: 10,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+    fontFamily: theme.fontFamily.mono,
+  },
+  categoryScroll: {
+    marginTop: 4,
+  },
+  categoryChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: theme.colors.surface,
+    borderWidth: 1.5,
+    borderColor: theme.colors.border,
+    marginRight: 8,
+  },
+  categoryChipEmoji: {
+    fontSize: 15,
+  },
+  categoryChipText: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
   },
 });

@@ -24,6 +24,7 @@ public class GroupController {
 
     private final GroupService groupService;
     private final UserRepository userRepository;
+    private final com.splitwise.splitwisebackend.service.SplitCalculationService splitCalculationService;
 
     private String getCurrentUserId() {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
@@ -36,7 +37,7 @@ public class GroupController {
     @PostMapping
     public ResponseEntity<Group> createGroup(@Valid @RequestBody CreateGroupRequest request) {
         String userId = getCurrentUserId();
-        Group group = groupService.createGroup(request.getName(), request.getMemberIds(), userId);
+        Group group = groupService.createGroup(request.getName(), request.getMemberIds(), userId, request.getDefaultCurrency());
         return ResponseEntity.ok(group);
     }
 
@@ -44,30 +45,53 @@ public class GroupController {
     public ResponseEntity<List<Group>> getGroups() {
         String userId = getCurrentUserId();
         List<Group> groups = groupService.getGroupsForUser(userId);
+        if (groups != null && splitCalculationService != null) {
+            for (Group group : groups) {
+                if (group.getId() != null) {
+                    try {
+                        Map<String, Double> balances = splitCalculationService.calculateRemainingNetBalancesForGroup(group.getId());
+                        double bal = balances.getOrDefault(userId, 0.0);
+                        group.setUserBalance(Math.round(bal * 100.0) / 100.0);
+                    } catch (Exception e) {
+                        group.setUserBalance(0.0);
+                    }
+                }
+            }
+        }
         return ResponseEntity.ok(groups);
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<Group> getGroup(@PathVariable String id) {
+    public ResponseEntity<Group> getGroup(@PathVariable("id") String id) {
+        String userId = getCurrentUserId();
         Group group = groupService.getGroupById(id);
+        if (group != null && group.getId() != null && splitCalculationService != null) {
+            try {
+                Map<String, Double> balances = splitCalculationService.calculateRemainingNetBalancesForGroup(group.getId());
+                double bal = balances.getOrDefault(userId, 0.0);
+                group.setUserBalance(Math.round(bal * 100.0) / 100.0);
+            } catch (Exception e) {
+                group.setUserBalance(0.0);
+            }
+        }
         return ResponseEntity.ok(group);
     }
 
     @PostMapping("/{id}/members")
-    public ResponseEntity<Group> addMember(@PathVariable String id, @RequestBody Map<String, String> body) {
+    public ResponseEntity<Group> addMember(@PathVariable("id") String id, @RequestBody Map<String, String> body) {
         String userId = body.get("userId");
         Group group = groupService.addMemberToGroup(id, userId);
         return ResponseEntity.ok(group);
     }
 
     @DeleteMapping("/{id}/members/{userId}")
-    public ResponseEntity<Group> removeMember(@PathVariable String id, @PathVariable String userId) {
+    public ResponseEntity<Group> removeMember(@PathVariable("id") String id, @PathVariable("userId") String userId) {
         Group group = groupService.removeMemberFromGroup(id, userId);
         return ResponseEntity.ok(group);
     }
 
     @GetMapping("/{id}/members")
-    public ResponseEntity<List<UserResponse>> getGroupMembers(@PathVariable String id) {
+    public ResponseEntity<List<UserResponse>> getGroupMembers(@PathVariable("id") String id) {
         Group group = groupService.getGroupById(id);
         List<String> memberIds = group.getMemberIds();
         
@@ -80,7 +104,8 @@ public class GroupController {
                         user.getEmail(),
                         user.getProfilePictureUrl(),
                         user.getPaymentQrUrl(),
-                        user.getCreatedAt() != null ? user.getCreatedAt().toString() : null
+                        user.getCreatedAt() != null ? user.getCreatedAt().toString() : null,
+                        user.getDefaultCurrency() != null ? user.getDefaultCurrency() : "INR"
                 ))
                 .collect(Collectors.toList());
         
@@ -88,7 +113,7 @@ public class GroupController {
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Void> deleteGroup(@PathVariable String id) {
+    public ResponseEntity<Void> deleteGroup(@PathVariable("id") String id) {
         String userId = getCurrentUserId();
         groupService.deleteGroup(id, userId);
         return ResponseEntity.noContent().build();

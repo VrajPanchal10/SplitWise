@@ -15,4 +15,7 @@ public class ParticipantShare {
     private Double paidAmount;
     private Double shareAmount;
     private Double netAmount;
+    private Double convertedPaidAmount;
+    private Double convertedShareAmount;
+    private Double convertedNetAmount;
 }

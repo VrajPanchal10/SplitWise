@@ -18,5 +18,10 @@ public class BillBreakdownResponse {
     private String paidBy;
     private String paidByName;
     private int participantCount;
+    private String currency;
+    private String baseCurrency;
+    private Double exchangeRate;
+    private String exchangeRateDate;
+    private Double convertedAmount;
     private List<ParticipantShare> participants;
 }

@@ -56,6 +56,25 @@ export const theme = {
   borderRadius,
 } as const;
 
+export const Colors = {
+  light: {
+    text: colors.textPrimary,
+    background: colors.background,
+    tint: colors.primary,
+    icon: colors.textSecondary,
+    tabIconDefault: colors.textSecondary,
+    tabIconSelected: colors.primary,
+  },
+  dark: {
+    text: colors.cream,
+    background: colors.heroBg,
+    tint: colors.primary,
+    icon: colors.heroMuted,
+    tabIconDefault: colors.heroMuted,
+    tabIconSelected: colors.primary,
+  },
+} as const;
+
 export type Theme = typeof theme;
 export type Colors = typeof colors;
 export type FontFamily = typeof fontFamily;

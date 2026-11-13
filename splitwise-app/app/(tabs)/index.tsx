@@ -1,11 +1,10 @@
-import { useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Image } from 'react-native';
+import { useState, useCallback, useEffect } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, Image, RefreshControl, DeviceEventEmitter } from 'react-native';
 import { Camera, Receipt, ArrowUpRight, ArrowDownLeft, Plus } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { theme } from '@/constants/theme';
 import { ZigzagEdge } from '@/components/ZigzagEdge';
 import { useRouter, useFocusEffect } from 'expo-router';
-import { useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import apiClient from '../../services/apiClient';
 
@@ -81,6 +80,7 @@ export default function HomeScreen() {
 
   const [groups, setGroups] = useState<Group[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [youOwe, setYouOwe] = useState(0);
   const [youAreOwed, setYouAreOwed] = useState(0);
 
@@ -91,52 +91,53 @@ export default function HomeScreen() {
     { tint: '#F3E8FF', color: '#7C3AED' },
   ];
 
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async (isSilent = false) => {
     if (!user || authLoading) return;
 
-    try {
+    if (!isSilent && groups.length === 0) {
       setIsLoading(true);
+    }
 
-      // Fetch user's groups
-      const groupsResponse = await apiClient.get('/groups');
-      const userGroups = groupsResponse.data;
+    try {
+      // Concurrently fetch user's groups and global friend balances in parallel
+      const [groupsResponse, balancesResponse] = await Promise.all([
+        apiClient.get('/groups').catch(err => {
+          console.error('Error fetching groups:', err);
+          return { data: [] };
+        }),
+        apiClient.get('/users/me/friend-balances').catch(err => {
+          console.error('Error fetching friend balances:', err);
+          return { data: [] };
+        }),
+      ]);
 
+      const userGroups = groupsResponse.data || [];
+      const transformedGroups: Group[] = userGroups.map((group: any, index: number) => {
+        const colorScheme = groupColors[index % groupColors.length];
+        const groupBalance = typeof group.userBalance === 'number' ? group.userBalance : 0;
+        return {
+          id: group.id || group._id,
+          name: group.name,
+          members: group.memberIds?.length || 0,
+          balance: groupBalance,
+          tint: colorScheme.tint,
+          color: colorScheme.color,
+        };
+      });
+
+      // Synchronize overall debt balance from authoritative friend-balances endpoint
+      const friendBalances = balancesResponse.data || [];
       let totalYouOwe = 0;
       let totalYouAreOwed = 0;
 
-      // For each group, fetch settlements to compute the user's net balance
-      const transformedGroups: Group[] = await Promise.all(
-        userGroups.map(async (group: any, index: number) => {
-          let groupBalance = 0;
-
-          try {
-            const settlementsResponse = await apiClient.get(`/bills/group/${group.id}/settlements`);
-            const settlements = settlementsResponse.data;
-
-            for (const settlement of settlements) {
-              if (settlement.fromUserId === user.id) {
-                totalYouOwe += settlement.amount;
-                groupBalance -= settlement.amount;
-              } else if (settlement.toUserId === user.id) {
-                totalYouAreOwed += settlement.amount;
-                groupBalance += settlement.amount;
-              }
-            }
-          } catch (error) {
-            console.error(`Error fetching settlements for group ${group.id}:`, error);
-          }
-
-          const colorScheme = groupColors[index % groupColors.length];
-          return {
-            id: group.id,
-            name: group.name,
-            members: group.memberIds?.length || 0,
-            balance: groupBalance,
-            tint: colorScheme.tint,
-            color: colorScheme.color,
-          };
-        })
-      );
+      for (const b of friendBalances) {
+        const bal = b.netBalance ?? (b as any).net_balance ?? 0;
+        if (bal > 0.005) {
+          totalYouAreOwed += bal;
+        } else if (bal < -0.005) {
+          totalYouOwe += Math.abs(bal);
+        }
+      }
 
       setGroups(transformedGroups);
       setYouOwe(totalYouOwe);
@@ -148,11 +149,59 @@ export default function HomeScreen() {
     }
   }, [user, authLoading]);
 
+  const onRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    await fetchData(true);
+    setIsRefreshing(false);
+  }, [fetchData]);
+
+  // Sync on screen focus + periodic background sync (every 8s) for group updates from co-members
   useFocusEffect(
     useCallback(() => {
-      fetchData();
+      fetchData(true);
+
+      const interval = setInterval(() => {
+        fetchData(true);
+      }, 8000);
+
+      return () => clearInterval(interval);
     }, [fetchData])
   );
+
+  // Listen for instant mutations from bill creation, updates, deletions, settlements, and group changes
+  useEffect(() => {
+    const billCreatedSub = DeviceEventEmitter.addListener('bill:created', () => {
+      fetchData(true);
+    });
+    const billUpdatedSub = DeviceEventEmitter.addListener('bill:updated', () => {
+      fetchData(true);
+    });
+    const billDeletedSub = DeviceEventEmitter.addListener('bill:deleted', () => {
+      fetchData(true);
+    });
+    const settlementSub = DeviceEventEmitter.addListener('settlement:recorded', () => {
+      fetchData(true);
+    });
+    const groupCreatedSub = DeviceEventEmitter.addListener('group:created', () => {
+      fetchData(true);
+    });
+    const groupUpdatedSub = DeviceEventEmitter.addListener('group:updated', () => {
+      fetchData(true);
+    });
+    const groupDeletedSub = DeviceEventEmitter.addListener('group:deleted', () => {
+      fetchData(true);
+    });
+
+    return () => {
+      billCreatedSub.remove();
+      billUpdatedSub.remove();
+      billDeletedSub.remove();
+      settlementSub.remove();
+      groupCreatedSub.remove();
+      groupUpdatedSub.remove();
+      groupDeletedSub.remove();
+    };
+  }, [fetchData]);
 
   const overallBalance = youAreOwed - youOwe;
 
@@ -213,7 +262,17 @@ export default function HomeScreen() {
       </View>
 
       {/* Body Content */}
-      <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.body}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefreshing}
+            onRefresh={onRefresh}
+            colors={[theme.colors.primary]}
+            tintColor={theme.colors.primary}
+          />
+        }>
         {isLoading ? (
           <View style={[styles.loadingContainer, { paddingVertical: 60 }]}>
             <ActivityIndicator size="large" color={theme.colors.primary} />

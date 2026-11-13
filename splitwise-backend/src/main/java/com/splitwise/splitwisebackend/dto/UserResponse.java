@@ -14,4 +14,10 @@ public class UserResponse {
     private String profilePictureUrl;
     private String paymentQrUrl;
     private String createdAt;
+    private String defaultCurrency;
+
+    public UserResponse(String id, String fullName, String email, String profilePictureUrl, String paymentQrUrl, String createdAt) {
+        this(id, fullName, email, profilePictureUrl, paymentQrUrl, createdAt, "INR");
+    }
 }
+

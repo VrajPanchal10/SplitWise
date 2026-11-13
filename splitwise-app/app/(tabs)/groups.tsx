@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, TextInput, Image } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, TextInput, Image, DeviceEventEmitter } from 'react-native';
 import { Users2, Search, UserPlus, X } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
@@ -52,21 +52,23 @@ export default function FriendsScreen() {
   const [isSearching, setIsSearching] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Fetch all friends (KEY FIX: this gets ALL friends, not just ones with balances)
+  // Fetch all friends (KEY FIX: this gets ALL friends, excluding current user)
   const fetchFriends = useCallback(async () => {
     if (!user) return;
 
     try {
       const response = await apiClient.get('/users/me/friends');
       console.log('Friends API response:', JSON.stringify(response.data));
-      // Map backend response (fullName) to frontend interface (name)
-      const mappedFriends: Friend[] = response.data.map((f: any) => ({
-        id: f.id,
-        name: f.fullName || f.name || '',
-        email: f.email,
-        avatarInitial: (f.fullName || f.name || 'U').charAt(0),
-        profilePictureUrl: f.profilePictureUrl,
-      }));
+      // Map backend response (fullName) to frontend interface (name), strictly excluding self
+      const mappedFriends: Friend[] = (response.data || [])
+        .filter((f: any) => f.id && f.id !== user.id)
+        .map((f: any) => ({
+          id: f.id,
+          name: f.fullName || f.name || '',
+          email: f.email,
+          avatarInitial: (f.fullName || f.name || 'U').charAt(0),
+          profilePictureUrl: f.profilePictureUrl,
+        }));
       setFriends(mappedFriends);
     } catch (error: any) {
       console.error('Error fetching friends:', error.message);
@@ -74,14 +76,18 @@ export default function FriendsScreen() {
     }
   }, [user]);
 
-  // Fetch friend balances separately
+  // Fetch friend balances separately (excluding current user self-balance)
   const fetchBalances = useCallback(async () => {
     if (!user) return;
 
     try {
       const response = await apiClient.get('/users/me/friend-balances');
       console.log('Balances API response:', JSON.stringify(response.data));
-      setBalances(response.data);
+      const filteredBalances = (response.data || []).filter((b: any) => {
+        const fid = b.friendId ?? b.friend_id;
+        return fid && fid !== user.id;
+      });
+      setBalances(filteredBalances);
     } catch (error: any) {
       console.error('Error fetching friend balances:', error.message);
       console.error('Error response data:', error.response?.data, 'status:', error.response?.status);
@@ -100,6 +106,32 @@ export default function FriendsScreen() {
     }, [fetchFriends, fetchBalances])
   );
 
+  // Listen for real-time app events to keep balances in sync
+  useEffect(() => {
+    const handleRefresh = () => {
+      fetchFriends();
+      fetchBalances();
+    };
+
+    const sub1 = DeviceEventEmitter.addListener('bill:created', handleRefresh);
+    const sub2 = DeviceEventEmitter.addListener('bill:updated', handleRefresh);
+    const sub3 = DeviceEventEmitter.addListener('bill:deleted', handleRefresh);
+    const sub4 = DeviceEventEmitter.addListener('settlement:recorded', handleRefresh);
+    const sub5 = DeviceEventEmitter.addListener('group:created', handleRefresh);
+    const sub6 = DeviceEventEmitter.addListener('group:updated', handleRefresh);
+    const sub7 = DeviceEventEmitter.addListener('group:deleted', handleRefresh);
+
+    return () => {
+      sub1.remove();
+      sub2.remove();
+      sub3.remove();
+      sub4.remove();
+      sub5.remove();
+      sub6.remove();
+      sub7.remove();
+    };
+  }, [fetchFriends, fetchBalances]);
+
   // Compute merged list and overall summary
   useEffect(() => {
     // Build a map of friendId -> netBalance from balances
@@ -107,23 +139,25 @@ export default function FriendsScreen() {
     balances.forEach((b) => {
       // Handle both possible field shapes: "friendId" or "friend_id"
       const fid = b.friendId ?? (b as any).friend_id;
-      if (fid) {
+      if (fid && fid !== user?.id) {
         balanceMap.set(fid, b.netBalance ?? (b as any).net_balance ?? 0);
       }
     });
 
-    // Show EVERY friend from the friends list, defaulting balance to 0
-    const merged: MergedFriend[] = friends.map((friend, index) => ({
-      id: friend.id,
-      name: friend.name,
-      avatarInitial: friend.avatarInitial || friend.name?.charAt(0) || 'U',
-      netBalance: balanceMap.get(friend.id) || 0,
-      color: getColorForIndex(index),
-      profilePictureUrl: friend.profilePictureUrl,
-    }));
+    // Show EVERY friend from the friends list, strictly excluding current user
+    const merged: MergedFriend[] = friends
+      .filter((friend) => friend.id && friend.id !== user?.id)
+      .map((friend, index) => ({
+        id: friend.id,
+        name: friend.name,
+        avatarInitial: friend.avatarInitial || friend.name?.charAt(0) || 'U',
+        netBalance: balanceMap.get(friend.id) || 0,
+        color: getColorForIndex(index),
+        profilePictureUrl: friend.profilePictureUrl,
+      }));
 
     setMergedFriends(merged);
-  }, [friends, balances]);
+  }, [friends, balances, user]);
 
   // Filter friends based on search query (case-insensitive substring match)
   const filteredFriends = isSearching && searchQuery.trim()
@@ -136,16 +170,16 @@ export default function FriendsScreen() {
   const overallBalance = mergedFriends.reduce((sum, friend) => sum + friend.netBalance, 0);
 
   let summaryText = "Overall, you're all settled up";
-  if (overallBalance > 0) {
+  if (overallBalance > 0.005) {
     summaryText = `Overall, you're owed ₹${overallBalance.toFixed(2)}`;
-  } else if (overallBalance < 0) {
+  } else if (overallBalance < -0.005) {
     summaryText = `Overall, you owe ₹${Math.abs(overallBalance).toFixed(2)}`;
   }
 
   let summaryColor: string = theme.colors.textSecondary;
-  if (overallBalance > 0) {
+  if (overallBalance > 0.005) {
     summaryColor = theme.colors.success;
-  } else if (overallBalance < 0) {
+  } else if (overallBalance < -0.005) {
     summaryColor = theme.colors.danger;
   }
 
@@ -260,20 +294,20 @@ const FriendRow: React.FC<{ friend: MergedFriend }> = ({ friend }) => {
   const router = useRouter();
 
   const getBalanceText = (balance: number) => {
-    if (balance > 0) return `₹${balance.toFixed(2)}`;
-    if (balance < 0) return `₹${Math.abs(balance).toFixed(2)}`;
+    if (balance > 0.005) return `₹${balance.toFixed(2)}`;
+    if (balance < -0.005) return `₹${Math.abs(balance).toFixed(2)}`;
     return 'Settled up';
   };
 
   const getBalanceStyle = (balance: number) => {
-    if (balance > 0) return theme.colors.success;
-    if (balance < 0) return theme.colors.danger;
+    if (balance > 0.005) return theme.colors.success;
+    if (balance < -0.005) return theme.colors.danger;
     return theme.colors.textSecondary;
   };
 
   const getBalanceLabel = (balance: number) => {
-    if (balance > 0) return 'owes you';
-    if (balance < 0) return 'you owe';
+    if (balance > 0.005) return 'owes you';
+    if (balance < -0.005) return 'you owe';
     return '';
   };
 
@@ -281,12 +315,13 @@ const FriendRow: React.FC<{ friend: MergedFriend }> = ({ friend }) => {
     <TouchableOpacity
       style={styles.row}
       activeOpacity={0.7}
-      onPress={() =>
+      onPress={() => {
+        if (!friend.id) return;
         router.push({
           pathname: '/friend/[id]',
           params: { id: friend.id, name: friend.name },
-        })
-      }>
+        });
+      }}>
       <View style={styles.avatarContainer}>
         <View style={[styles.avatar, { backgroundColor: friend.color }]}>
           {friend.profilePictureUrl ? (

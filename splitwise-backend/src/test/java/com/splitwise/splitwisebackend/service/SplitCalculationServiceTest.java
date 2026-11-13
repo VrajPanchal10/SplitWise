@@ -14,6 +14,8 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -610,5 +612,269 @@ class SplitCalculationServiceTest {
         assertEquals(0.0, netBalances.get("p2"), 0.001);
         // p3 paid 0, owes 100 + 50 = 150 => net -150
         assertEquals(-150.0, netBalances.get("p3"), 0.001);
+    }
+
+    // =========================================================================
+    // MANDATORY TASK CASES: SETTLEMENT SYNCHRONIZATION TESTS
+    // =========================================================================
+
+    /**
+     * CASE A: One person pays entire expense.
+     * Group: Jammu Kashmir Trip
+     * Vraj paid ₹3,529. Equal split among 4 people = ₹882.25 each.
+     * Expected: Mehr -> Vraj ₹882.25, Nidhi -> Vraj ₹882.25, User4 -> Vraj ₹882.25.
+     * Vraj must never owe himself.
+     */
+    @Test
+    void testCaseA_onePersonPaysEntireExpense_allDebtorsOweEqualShares() {
+        String groupId = "jk-trip";
+        Bill traveling = bill("b-travel", groupId, "vraj", 3529.0,
+                List.of(item("Traveling", 3529.0, List.of("vraj", "mehr", "nidhi", "user4"))));
+
+        when(billRepository.findByGroupId(groupId)).thenReturn(List.of(traveling));
+        when(settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID))
+                .thenReturn(List.of());
+
+        List<Settlement> settlements = service.getSettlementsForGroup(groupId);
+
+        assertEquals(3, settlements.size(), "Exactly 3 debtors must owe Vraj");
+        for (Settlement s : settlements) {
+            assertEquals("vraj", s.getToUserId(), "All payments must go to Vraj");
+            assertNotEquals("vraj", s.getFromUserId(), "Vraj must never owe himself");
+            assertEquals(882.25, s.getAmount(), 0.001, "Each debtor owes exactly ₹882.25");
+        }
+
+        // Verify remaining net balances
+        Map<String, Double> remaining = service.calculateRemainingNetBalancesForGroup(groupId);
+        assertEquals(2646.75, remaining.get("vraj"), 0.001);
+        assertEquals(-882.25, remaining.get("mehr"), 0.001);
+        assertEquals(-882.25, remaining.get("nidhi"), 0.001);
+        assertEquals(-882.25, remaining.get("user4"), 0.001);
+
+        // Verify original bill remains completely unchanged
+        assertEquals(3529.0, traveling.getTotalAmount(), 0.001);
+        assertEquals("vraj", traveling.getPaidBy());
+    }
+
+    /**
+     * CASE B: One debtor settles the complete amount.
+     * Mehr pays Vraj ₹882.25.
+     * Expected: Mehr owes ₹0, Nidhi -> Vraj ₹882.25, User4 -> Vraj ₹882.25.
+     * Vraj total receivable decreases by ₹882.25 to ₹1764.50.
+     */
+    @Test
+    void testCaseB_oneDebtorSettlesCompleteAmount_debtBecomesZero_othersUnchanged() {
+        String groupId = "jk-trip";
+        Bill traveling = bill("b-travel", groupId, "vraj", 3529.0,
+                List.of(item("Traveling", 3529.0, List.of("vraj", "mehr", "nidhi", "user4"))));
+
+        SettlementRecord mehrPaid = new SettlementRecord();
+        mehrPaid.setGroupId(groupId);
+        mehrPaid.setFromUserId("mehr");
+        mehrPaid.setToUserId("vraj");
+        mehrPaid.setAmount(882.25);
+        mehrPaid.setStatus(SettlementRecord.Status.PAID);
+
+        when(billRepository.findByGroupId(groupId)).thenReturn(List.of(traveling));
+        when(settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID))
+                .thenReturn(List.of(mehrPaid));
+
+        List<Settlement> settlements = service.getSettlementsForGroup(groupId);
+
+        assertEquals(2, settlements.size(), "Only Nidhi and User4 should remain owing");
+        assertTrue(settlements.stream().noneMatch(s -> s.getFromUserId().equals("mehr")),
+                "Mehr must have zero remaining debt");
+        assertTrue(settlements.stream().anyMatch(s -> s.getFromUserId().equals("nidhi") && s.getAmount() == 882.25));
+        assertTrue(settlements.stream().anyMatch(s -> s.getFromUserId().equals("user4") && s.getAmount() == 882.25));
+
+        Map<String, Double> remaining = service.calculateRemainingNetBalancesForGroup(groupId);
+        assertEquals(0.0, remaining.get("mehr"), 0.001, "Mehr's remaining balance must be exactly 0.0");
+        assertEquals(1764.50, remaining.get("vraj"), 0.001, "Vraj receivable must be reduced to ₹1764.50");
+
+        // Original bill is untouched
+        assertEquals(3529.0, traveling.getTotalAmount(), 0.001);
+    }
+
+    /**
+     * CASE C: One debtor partially settles.
+     * Mehr owes ₹882.25 and pays ₹500.00.
+     * Expected:
+     * - Mehr owes Vraj ₹382.25
+     * - Nidhi owes Vraj ₹882.25
+     * - User4 owes Vraj ₹882.25
+     * - Vraj receivable becomes ₹2146.75.
+     */
+    @Test
+    void testCaseC_oneDebtorPartiallySettles_partialDebtRemaining() {
+        String groupId = "jk-trip";
+        Bill traveling = bill("b-travel", groupId, "vraj", 3529.0,
+                List.of(item("Traveling", 3529.0, List.of("vraj", "mehr", "nidhi", "user4"))));
+
+        SettlementRecord partialSettlement = new SettlementRecord();
+        partialSettlement.setGroupId(groupId);
+        partialSettlement.setFromUserId("mehr");
+        partialSettlement.setToUserId("vraj");
+        partialSettlement.setAmount(500.0);
+        partialSettlement.setStatus(SettlementRecord.Status.PAID);
+
+        when(billRepository.findByGroupId(groupId)).thenReturn(List.of(traveling));
+        when(settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID))
+                .thenReturn(List.of(partialSettlement));
+
+        List<Settlement> settlements = service.getSettlementsForGroup(groupId);
+
+        assertEquals(3, settlements.size());
+        Settlement mehrDebt = settlements.stream()
+                .filter(s -> s.getFromUserId().equals("mehr"))
+                .findFirst().orElseThrow();
+        assertEquals("vraj", mehrDebt.getToUserId());
+        assertEquals(382.25, mehrDebt.getAmount(), 0.001, "Mehr remaining debt must be ₹382.25");
+
+        Map<String, Double> remaining = service.calculateRemainingNetBalancesForGroup(groupId);
+        assertEquals(-382.25, remaining.get("mehr"), 0.001);
+        assertEquals(2146.75, remaining.get("vraj"), 0.001);
+
+        // Original bill is untouched
+        assertEquals(3529.0, traveling.getTotalAmount(), 0.001);
+    }
+
+    /**
+     * CASE D: Multiple debtors settle independently.
+     * Mehr settles ₹882.25 and Nidhi settles ₹882.25 independently.
+     * Expected:
+     * - User4 owes Vraj ₹882.25
+     * - Mehr owes ₹0
+     * - Nidhi owes ₹0
+     * - Vraj receivable becomes ₹882.25.
+     */
+    @Test
+    void testCaseD_multipleDebtorsSettleIndependently() {
+        String groupId = "jk-trip";
+        Bill traveling = bill("b-travel", groupId, "vraj", 3529.0,
+                List.of(item("Traveling", 3529.0, List.of("vraj", "mehr", "nidhi", "user4"))));
+
+        SettlementRecord mehrPaid = new SettlementRecord();
+        mehrPaid.setGroupId(groupId);
+        mehrPaid.setFromUserId("mehr");
+        mehrPaid.setToUserId("vraj");
+        mehrPaid.setAmount(882.25);
+        mehrPaid.setStatus(SettlementRecord.Status.PAID);
+
+        SettlementRecord nidhiPaid = new SettlementRecord();
+        nidhiPaid.setGroupId(groupId);
+        nidhiPaid.setFromUserId("nidhi");
+        nidhiPaid.setToUserId("vraj");
+        nidhiPaid.setAmount(882.25);
+        nidhiPaid.setStatus(SettlementRecord.Status.PAID);
+
+        when(billRepository.findByGroupId(groupId)).thenReturn(List.of(traveling));
+        when(settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID))
+                .thenReturn(List.of(mehrPaid, nidhiPaid));
+
+        List<Settlement> settlements = service.getSettlementsForGroup(groupId);
+
+        assertEquals(1, settlements.size(), "Only User4 should owe Vraj");
+        Settlement user4Debt = settlements.get(0);
+        assertEquals("user4", user4Debt.getFromUserId());
+        assertEquals("vraj", user4Debt.getToUserId());
+        assertEquals(882.25, user4Debt.getAmount(), 0.001);
+
+        Map<String, Double> remaining = service.calculateRemainingNetBalancesForGroup(groupId);
+        assertEquals(0.0, remaining.get("mehr"), 0.001);
+        assertEquals(0.0, remaining.get("nidhi"), 0.001);
+        assertEquals(-882.25, remaining.get("user4"), 0.001);
+        assertEquals(882.25, remaining.get("vraj"), 0.001);
+
+        // Invariant: sum of all remaining balances is 0.0
+        double sum = remaining.values().stream().mapToDouble(Double::doubleValue).sum();
+        assertEquals(0.0, Math.round(sum * 100.0) / 100.0, 0.001);
+
+        // Original bill is untouched
+        assertEquals(3529.0, traveling.getTotalAmount(), 0.001);
+    }
+
+    /**
+     * CASE E: Task specific verification scenario:
+     * 1. Vraj Panchal creates a ₹1,000 bill split equally between Vraj and Nidhi.
+     *    Result: Nidhi owes Vraj ₹500.
+     *    Group member Mehr Panchal is not in the split and owes ₹0.
+     * 2. Nidhi Shah records a successful ₹500 settlement to Vraj.
+     * 3. Assertions:
+     *    - Group settlements list is empty (no remaining debts).
+     *    - Nidhi balance is exactly 0.0 (no longer owes ₹500).
+     *    - Vraj balance is exactly 0.0 (received the full amount).
+     *    - Mehr balance remains 0.0.
+     *    - Sum of all balances remains identically 0.0 (conservation of money).
+     */
+    @Test
+    void testCaseE_vrajNidhiMehr_billAndSettlementSync() {
+        String groupId = "group-sync-demo";
+        Bill dinnerBill = bill("b-dinner", groupId, "vraj", 1000.0,
+                List.of(item("Dinner", 1000.0, List.of("vraj", "nidhi"))));
+
+        // Step 1: Before settlement
+        when(billRepository.findByGroupId(groupId)).thenReturn(List.of(dinnerBill));
+        when(settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID))
+                .thenReturn(List.of());
+
+        List<Settlement> preSettlements = service.getSettlementsForGroup(groupId);
+        assertEquals(1, preSettlements.size(), "Before settlement, exactly 1 debt should exist");
+        Settlement preDebt = preSettlements.get(0);
+        assertEquals("nidhi", preDebt.getFromUserId());
+        assertEquals("vraj", preDebt.getToUserId());
+        assertEquals(500.0, preDebt.getAmount(), 0.001);
+
+        Map<String, Double> preBalances = service.calculateRemainingNetBalancesForGroup(groupId);
+        assertEquals(500.0, preBalances.get("vraj"), 0.001);
+        assertEquals(-500.0, preBalances.get("nidhi"), 0.001);
+
+        // Step 2: Nidhi records successful ₹500 settlement to Vraj
+        SettlementRecord settlementRecord = new SettlementRecord();
+        settlementRecord.setId("settle-1");
+        settlementRecord.setGroupId(groupId);
+        settlementRecord.setFromUserId("nidhi");
+        settlementRecord.setToUserId("vraj");
+        settlementRecord.setAmount(500.0);
+        settlementRecord.setCurrency("INR");
+        settlementRecord.setStatus(SettlementRecord.Status.PAID);
+
+        when(settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID))
+                .thenReturn(List.of(settlementRecord));
+
+        // Step 3: Check post-settlement state for all group members (Vraj, Nidhi, Mehr)
+        List<Settlement> postSettlements = service.getSettlementsForGroup(groupId);
+        assertTrue(postSettlements.isEmpty(), "All debts in group must be settled; list must be empty");
+
+        Map<String, Double> postBalances = service.calculateRemainingNetBalancesForGroup(groupId);
+        assertEquals(0.0, postBalances.get("nidhi"), 0.001, "Nidhi must no longer owe ₹500 (balance == 0.0)");
+        assertEquals(0.0, postBalances.get("vraj"), 0.001, "Vraj balance must be settled (balance == 0.0)");
+        assertNull(postBalances.get("mehr"), "Mehr was not in bill so has no non-zero net balance");
+
+        // Verify conservation of money
+        double sum = postBalances.values().stream().mapToDouble(Double::doubleValue).sum();
+        assertEquals(0.0, Math.round(sum * 100.0) / 100.0, 0.001, "Money conservation invariant preserved");
+    }
+
+    @Test
+    void testNullHandling_corruptedBillRecordsWithNulls_doesNotThrow() {
+        String groupId = "group-corrupted";
+        Bill corruptedBill = new Bill();
+        corruptedBill.setId("bill-corrupted");
+        corruptedBill.setGroupId(groupId);
+        corruptedBill.setPaidBy(null); // null payer
+
+        BillItem itemWithNullPrice = new BillItem("Item 1", null, Arrays.asList("userA", null, "userB"), null);
+        BillItem itemWithNegativePrice = new BillItem("Item 2", -10.0, Collections.singletonList("userA"), null);
+        BillItem validItem = new BillItem("Item 3", 100.0, Arrays.asList("userA", "userB", null), null);
+
+        corruptedBill.setItems(Arrays.asList(itemWithNullPrice, itemWithNegativePrice, validItem));
+
+        when(billRepository.findByGroupId(groupId)).thenReturn(Collections.singletonList(corruptedBill));
+
+        // Must not throw NullPointerException or IllegalArgumentException
+        assertDoesNotThrow(() -> {
+            List<Settlement> settlements = service.getSettlementsForGroup(groupId);
+            assertNotNull(settlements);
+        });
     }
 }

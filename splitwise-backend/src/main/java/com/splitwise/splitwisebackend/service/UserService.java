@@ -31,6 +31,7 @@ public class UserService {
     private final GroupRepository groupRepository;
     private final SettlementRecordRepository settlementRecordRepository;
     private final SplitCalculationService splitCalculationService;
+    private final CurrencyConversionService currencyConversionService;
 
     public User getUserById(String userId) {
         return userRepository.findById(userId)
@@ -114,136 +115,183 @@ public class UserService {
         List<Group> userGroups = groupRepository.findByMemberIdsContaining(userId);
         
         // 3. Collect all other member IDs from those groups (group co-members)
-        //    and track active group IDs so we can filter out bills from deleted groups.
+        //    and track active group IDs.
         Set<String> groupCoMemberIds = new HashSet<>();
         Set<String> activeGroupIds = new HashSet<>();
         for (Group group : userGroups) {
-            activeGroupIds.add(group.getId());
+            if (group.getId() != null) {
+                activeGroupIds.add(group.getId());
+            }
             if (group.getMemberIds() != null) {
                 for (String memberId : group.getMemberIds()) {
-                    if (!memberId.equals(userId)) {
+                    if (memberId != null && !memberId.equals(userId)) {
                         groupCoMemberIds.add(memberId);
                     }
                 }
             }
         }
         
-        // 4. Get balances for group co-members from bills by calculating net balances
-        //    We need to find all bills where these group co-members are participants
-        List<FriendBalance> groupCoMemberBalances = new ArrayList<>();
-        
-        if (!groupCoMemberIds.isEmpty()) {
-            // Get all bills involving these users
-            List<Bill> allBills = billRepository.findAll();
-            
-            // Calculate net balance for each group co-member
-            Map<String, Double> coMemberNetBalances = new HashMap<>();
-            
-            for (Bill bill : allBills) {
-                // Skip bills that belong to deleted groups (orphaned bills)
-                if (bill.getGroupId() == null || !activeGroupIds.contains(bill.getGroupId())) {
-                    continue;
-                }
-                
-                // Skip personal expenses (no group or only 1 unique participant)
-                if (isPersonalExpense(bill)) {
-                    continue;
-                }
-                
-                // Get all unique participants in this bill
-                Set<String> participants = new HashSet<>();
-                for (BillItem item : bill.getItems()) {
-                    if (item.getSharedByUserIds() != null) {
-                        participants.addAll(item.getSharedByUserIds());
+        // 4. Calculate pairwise balances with friends/co-members:
+        //    A) From group settlements (the canonical simplified debts per group)
+        Map<String, Double> dynamicBalances = new HashMap<>();
+
+        for (Group group : userGroups) {
+            if (group.getId() == null) continue;
+            List<com.splitwise.splitwisebackend.dto.Settlement> groupSettlements =
+                    splitCalculationService.getSettlementsForGroup(group.getId());
+            if (groupSettlements == null) continue;
+
+            for (com.splitwise.splitwisebackend.dto.Settlement s : groupSettlements) {
+                if (s.getToUserId() != null && s.getToUserId().equals(userId)) {
+                    // fromUserId owes current user (+amount)
+                    String friendId = s.getFromUserId();
+                    if (friendId != null && !friendId.equals(userId)) {
+                        dynamicBalances.put(friendId,
+                                roundToTwoDecimals(dynamicBalances.getOrDefault(friendId, 0.0) + s.getAmount()));
                     }
-                }
-                
-                // If this bill involves any of our group co-members, calculate their share
-                for (String participantId : participants) {
-                    if (groupCoMemberIds.contains(participantId)) {
-                        // Calculate the share for this participant in this bill
-                        double share = splitCalculationService.calculateIndividualShares(bill).getOrDefault(participantId, 0.0);
-                        coMemberNetBalances.put(participantId, 
-                            coMemberNetBalances.getOrDefault(participantId, 0.0) + share);
+                } else if (s.getFromUserId() != null && s.getFromUserId().equals(userId)) {
+                    // Current user owes toUserId (-amount)
+                    String friendId = s.getToUserId();
+                    if (friendId != null && !friendId.equals(userId)) {
+                        dynamicBalances.put(friendId,
+                                roundToTwoDecimals(dynamicBalances.getOrDefault(friendId, 0.0) - s.getAmount()));
                     }
                 }
             }
-            
-            // Create FriendBalance entries for group co-members with non-zero balances
-            for (Map.Entry<String, Double> entry : coMemberNetBalances.entrySet()) {
-                if (Math.abs(entry.getValue()) > 0.01) {
-                    FriendBalance fb = new FriendBalance();
-                    fb.setUserId(userId);
-                    fb.setFriendId(entry.getKey());
-                    fb.setNetBalance(entry.getValue());
-                    groupCoMemberBalances.add(fb);
-                }
-            }
-        }
-        
-        // 5. Combine explicit friend balances with group co-member balances.
-        //    Dynamic group co-member balances take precedence so new bills
-        //    in new groups show up correctly.
-        Map<String, FriendBalance> combinedMap = new LinkedHashMap<>();
-        
-        // Add explicit friend balances first
-        for (FriendBalance fb : explicitBalances) {
-            combinedMap.put(fb.getFriendId(), fb);
-        }
-        
-        // Add/override with group co-member balances (dynamic computation wins)
-        for (FriendBalance fb : groupCoMemberBalances) {
-            combinedMap.put(fb.getFriendId(), fb);
         }
 
-        // 6. Apply PAID settlement adjustments to balances.
-        //    When the user settles up with a friend, PAID settlement records
-        //    are created. Those amounts are applied here directionally:
-        //    - If I paid the friend (fromUserId = me): my debt decreases, so
-        //      my balance goes up (adds to the balance, making it less negative).
-        //    - If the friend paid me (toUserId = me): their debt to me decreases,
-        //      so my balance goes down (subtract from the balance).
-        //    This is fully dynamic — if new bills are added later, the balance
-        //    grows again and correctly shows the new amount owed.
+        //    B) For direct 1-on-1 / non-group bills involving userId and friends
+        List<Bill> allBills = billRepository.findAll();
+        for (Bill bill : allBills) {
+            if (bill.getGroupId() != null && activeGroupIds.contains(bill.getGroupId())) {
+                // Group bills are already accounted for by getSettlementsForGroup above
+                continue;
+            }
+            if (isPersonalExpense(bill)) {
+                continue;
+            }
+
+            Map<String, Double> inrShares = splitCalculationService.calculateIndividualInrShares(bill);
+            String payer = bill.getPaidBy();
+            if (payer == null) continue;
+
+            if (payer.equals(userId)) {
+                // Current user paid: other participants owe user their share in INR
+                for (Map.Entry<String, Double> entry : inrShares.entrySet()) {
+                    String friendId = entry.getKey();
+                    if (friendId != null && !friendId.equals(userId)) {
+                        dynamicBalances.put(friendId,
+                                roundToTwoDecimals(dynamicBalances.getOrDefault(friendId, 0.0) + entry.getValue()));
+                    }
+                }
+            } else if (inrShares.containsKey(userId)) {
+                // Friend paid: current user owes friend user's share in INR
+                double userShare = inrShares.get(userId);
+                if (!payer.equals(userId)) {
+                    dynamicBalances.put(payer,
+                            roundToTwoDecimals(dynamicBalances.getOrDefault(payer, 0.0) - userShare));
+                }
+            }
+        }
+
+        // 5. Combine explicit friend balances with dynamically computed balances
+        Map<String, FriendBalance> combinedMap = new LinkedHashMap<>();
+
+        // Add explicit friend balances first
+        for (FriendBalance fb : explicitBalances) {
+            if (fb.getFriendId() != null && !fb.getFriendId().equals(userId)) {
+                combinedMap.put(fb.getFriendId(), fb);
+            }
+        }
+
+        // Add/override with dynamically computed balances
+        for (Map.Entry<String, Double> entry : dynamicBalances.entrySet()) {
+            String friendId = entry.getKey();
+            if (friendId.equals(userId)) continue; // Never owe oneself
+
+            FriendBalance fb = combinedMap.getOrDefault(friendId, new FriendBalance());
+            fb.setUserId(userId);
+            fb.setFriendId(friendId);
+            fb.setNetBalance(roundToTwoDecimals(entry.getValue()));
+            combinedMap.put(friendId, fb);
+        }
+
+        // Ensure all group co-members exist in combinedMap (even if settled at 0.0)
+        for (String coMemberId : groupCoMemberIds) {
+            if (!coMemberId.equals(userId)) {
+                if (!dynamicBalances.containsKey(coMemberId)) {
+                    // No remaining simplified group debt: explicitly set to 0.0
+                    FriendBalance fb = combinedMap.getOrDefault(coMemberId, new FriendBalance());
+                    fb.setUserId(userId);
+                    fb.setFriendId(coMemberId);
+                    fb.setNetBalance(0.0);
+                    combinedMap.put(coMemberId, fb);
+                }
+            }
+        }
+
+        // 6. Apply PAID settlement adjustments for non-group settlements (strictly in INR)
         for (FriendBalance fb : combinedMap.values()) {
             List<SettlementRecord> paidWithFriend = settlementRecordRepository
                     .findSettlementsBetweenUsersAndStatus(userId, fb.getFriendId(), SettlementRecord.Status.PAID);
             double adjustment = 0;
             for (SettlementRecord sr : paidWithFriend) {
+                // Skip group settlements since getSettlementsForGroup already deducted them
+                if (sr.getGroupId() != null && activeGroupIds.contains(sr.getGroupId())) {
+                    continue;
+                }
                 if (sr.getAmount() == null) continue;
+                double settleAmount = sr.getAmount();
+                if (sr.getCurrency() != null && !sr.getCurrency().equalsIgnoreCase("INR") && currencyConversionService != null) {
+                    double rate = currencyConversionService.getExchangeRate(sr.getCurrency(), "INR");
+                    settleAmount = roundToTwoDecimals(settleAmount * rate);
+                }
                 if (userId.equals(sr.getFromUserId())) {
-                    // I paid the friend — reduces what I owe
-                    adjustment += sr.getAmount();
+                    // I paid friend: debt decreases
+                    adjustment += settleAmount;
                 } else if (userId.equals(sr.getToUserId())) {
-                    // Friend paid me — reduces what they owe me
-                    adjustment -= sr.getAmount();
+                    // Friend paid me: credit decreases
+                    adjustment -= settleAmount;
                 }
             }
             if (adjustment != 0) {
                 double current = fb.getNetBalance() != null ? fb.getNetBalance() : 0.0;
-                fb.setNetBalance(current + adjustment);
+                fb.setNetBalance(roundToTwoDecimals(current + adjustment));
             }
         }
-        
+
         return new ArrayList<>(combinedMap.values());
     }
 
+    private static double roundToTwoDecimals(double value) {
+        return Math.round(value * 100.0) / 100.0;
+    }
+
     private boolean isPersonalExpense(Bill bill) {
-        // If the bill has no groupId, it's a personal expense
-        if (bill.getGroupId() == null || bill.getGroupId().isEmpty()) {
+        if (bill == null) {
             return true;
         }
 
-        // Collect all unique participant IDs from all items
-        Set<String> participants = new HashSet<>();
+        if (bill.getItems() == null || bill.getItems().isEmpty()) {
+            return true;
+        }
+
+        // Collect all unique persons involved (payer + all item participants)
+        Set<String> persons = new HashSet<>();
+        if (bill.getPaidBy() != null && !bill.getPaidBy().trim().isEmpty()) {
+            persons.add(bill.getPaidBy().trim());
+        }
         for (BillItem item : bill.getItems()) {
-            if (item.getSharedByUserIds() != null) {
-                participants.addAll(item.getSharedByUserIds());
+            if (item != null && item.getSharedByUserIds() != null) {
+                for (String uid : item.getSharedByUserIds()) {
+                    if (uid != null && !uid.trim().isEmpty()) {
+                        persons.add(uid.trim());
+                    }
+                }
             }
         }
 
-        // If there's only one unique participant, it's a personal expense
-        return participants.size() <= 1;
+        return persons.size() <= 1;
     }
 
     /**

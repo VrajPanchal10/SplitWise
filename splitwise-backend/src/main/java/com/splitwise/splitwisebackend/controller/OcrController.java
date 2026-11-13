@@ -59,6 +59,7 @@ public class OcrController {
         response.put("suggestedTitle", parseResult.getSuggestedTitle());
         response.put("totalAmount", parseResult.getTotalAmount());
         response.put("confidence", parseResult.getConfidence());
+        response.put("currency", parseResult.getCurrency());
         response.put("receiptUrl", receiptUrl);
         // Financial breakdown fields
         response.put("subtotal", parseResult.getSubtotal());
@@ -67,7 +68,15 @@ public class OcrController {
         response.put("tax", parseResult.getTax());
         response.put("serviceCharge", parseResult.getServiceCharge());
         response.put("discount", parseResult.getDiscount());
+        response.put("tip", parseResult.getTip());
         response.put("roundOff", parseResult.getRoundOff());
+        response.put("amountPaid", parseResult.getAmountPaid());
+        response.put("change", parseResult.getChange());
+        // Detailed validation & confidence indicators
+        response.put("validationStatus", parseResult.getValidationStatus());
+        response.put("validationMessage", parseResult.getValidationMessage());
+        response.put("ocrConfidence", parseResult.getOcrConfidence());
+        response.put("parsingConfidence", parseResult.getParsingConfidence());
 
         return ResponseEntity.ok(response);
     }

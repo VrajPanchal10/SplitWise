@@ -16,6 +16,8 @@ export interface BillItem {
 interface BillCreationContextType {
   groupId: string;
   setGroupId: (groupId: string) => void;
+  currency: string;
+  setCurrency: (currency: string) => void;
   scannedItems: BillItem[];
   setScannedItems: (items: BillItem[]) => void;
   receiptUrl: string | null;
@@ -27,11 +29,13 @@ const BillCreationContext = createContext<BillCreationContextType | undefined>(u
 
 export const BillCreationProvider = ({ children }: { children: ReactNode }) => {
   const [groupId, setGroupId] = useState('');
+  const [currency, setCurrency] = useState('INR');
   const [scannedItems, setScannedItems] = useState<BillItem[]>([]);
   const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
 
   const resetBill = () => {
     setGroupId('');
+    setCurrency('INR');
     setScannedItems([]);
     setReceiptUrl(null);
   };
@@ -41,6 +45,8 @@ export const BillCreationProvider = ({ children }: { children: ReactNode }) => {
     value={{
         groupId,
         setGroupId,
+        currency,
+        setCurrency,
         scannedItems,
         setScannedItems,
         receiptUrl,

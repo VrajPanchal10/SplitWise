@@ -20,5 +20,7 @@ public class User {
     private String password;
     private String profilePictureUrl;
     private String paymentQrUrl;
+    @com.fasterxml.jackson.annotation.JsonFormat(shape = com.fasterxml.jackson.annotation.JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
     private LocalDateTime createdAt;
+    private String defaultCurrency = "INR";
 }

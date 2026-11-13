@@ -16,6 +16,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -28,6 +30,7 @@ public class BillService {
     private final GroupRepository groupRepository;
     private final UserRepository userRepository;
     private final ActivityService activityService;
+    private final CurrencyConversionService currencyConversionService;
 
     public Bill createBill(CreateBillRequest request) {
         validateBillRequest(request);
@@ -36,7 +39,27 @@ public class BillService {
         bill.setTitle(request.getTitle().trim());
         bill.setGroupId(request.getGroupId());
         bill.setPaidBy(request.getPaidBy());
-        bill.setCreatedAt(LocalDateTime.now());
+        bill.setCreatedAt(LocalDateTime.now(ZoneOffset.UTC));
+
+        String currency = request.getCurrency() != null && !request.getCurrency().trim().isEmpty()
+                ? currencyConversionService.validateAndNormalizeCurrency(request.getCurrency())
+                : "INR";
+        bill.setCurrency(currency);
+
+        // Universal base settlement currency is strictly INR
+        final String baseCurrency = "INR";
+        bill.setBaseCurrency(baseCurrency);
+
+        double rate;
+        if ("INR".equalsIgnoreCase(currency)) {
+            rate = 1.0;
+        } else if (request.getExchangeRate() != null && request.getExchangeRate() > 0) {
+            rate = request.getExchangeRate();
+        } else {
+            rate = currencyConversionService.getExchangeRate(currency, baseCurrency);
+        }
+        bill.setExchangeRate(rate);
+        bill.setExchangeRateDate(LocalDateTime.now(ZoneOffset.UTC));
 
         List<BillItem> items = request.getItems().stream()
                 .map(this::mapToBillItem)
@@ -52,6 +75,14 @@ public class BillService {
                     .sum();
             bill.setTotalAmount(Math.round(total * 100.0) / 100.0);
         }
+
+        bill.setConvertedAmount(currencyConversionService.roundToTwoDecimals(bill.getTotalAmount() * rate));
+
+        // Category
+        String category = request.getCategory() != null && !request.getCategory().trim().isEmpty()
+                ? request.getCategory().trim()
+                : "Other";
+        bill.setCategory(category);
 
         Bill saved = billRepository.save(bill);
 
@@ -83,28 +114,45 @@ public class BillService {
                 }
             }
 
+            String groupName = null;
+            if (bill.getGroupId() != null) {
+                groupName = groupRepository.findById(bill.getGroupId()).map(Group::getName).orElse(null);
+            }
+
+            String curr = bill.getCurrency() != null ? bill.getCurrency() : "INR";
+            String symbol = currencyConversionService.getCurrencySymbol(curr);
+            String amountFormatted = symbol + formatAmount(bill.getTotalAmount()) + " " + curr;
+            if (bill.getBaseCurrency() != null && !bill.getBaseCurrency().equalsIgnoreCase(curr) && bill.getConvertedAmount() != null) {
+                String baseSymbol = currencyConversionService.getCurrencySymbol(bill.getBaseCurrency());
+                amountFormatted += " (≈ " + baseSymbol + formatAmount(bill.getConvertedAmount()) + " " + bill.getBaseCurrency() + ")";
+            }
+
             // The payer always gets an entry
-            String payerDescription = "You added '" + bill.getTitle() + "' (₹" + formatAmount(bill.getTotalAmount()) + ")";
+            String payerDescription = "You added '" + bill.getTitle() + "' (" + amountFormatted + ")";
             activityService.logActivity(
                     payerId,
                     "EXPENSE_ADDED",
                     payerDescription,
                     bill.getGroupId(),
                     bill.getId(),
-                    payerId);
+                    payerId,
+                    groupName,
+                    bill.getTotalAmount());
             log.info("Activity logged: {}", payerDescription);
 
             // Every other participant gets an entry naming the payer
             for (String participantId : participantIds) {
                 if (!participantId.equals(payerId)) {
-                    String participantDescription = payerName + " added '" + bill.getTitle() + "' (₹" + formatAmount(bill.getTotalAmount()) + ")";
+                    String participantDescription = payerName + " added '" + bill.getTitle() + "' (" + amountFormatted + ")";
                     activityService.logActivity(
                             participantId,
                             "EXPENSE_ADDED",
                             participantDescription,
                             bill.getGroupId(),
                             bill.getId(),
-                            payerId);
+                            payerId,
+                            groupName,
+                            bill.getTotalAmount());
                     log.info("Activity logged: {} (for user {})", participantDescription, participantId);
                 }
             }
@@ -155,6 +203,12 @@ public class BillService {
             throw new ApiException("At least one bill item is required", HttpStatus.BAD_REQUEST);
         }
 
+        String curr = request.getCurrency() != null && !request.getCurrency().trim().isEmpty()
+                ? request.getCurrency().trim().toUpperCase()
+                : "INR";
+        currencyConversionService.validateCurrency(curr);
+        String symbol = currencyConversionService.getCurrencySymbol(curr);
+
         java.util.Set<String> allParticipants = new java.util.HashSet<>();
         double itemsSum = 0.0;
 
@@ -182,8 +236,8 @@ public class BillService {
                     customSum += entry.getValue();
                 }
                 if (item.getPrice() != null && Math.abs(customSum - item.getPrice()) > 0.05) {
-                    throw new ApiException("Custom shares for '" + item.getName() + "' (₹" +
-                            String.format("%.2f", customSum) + ") must sum to item price (₹" +
+                    throw new ApiException("Custom shares for '" + item.getName() + "' (" + symbol +
+                            String.format("%.2f", customSum) + ") must sum to item price (" + symbol +
                             String.format("%.2f", item.getPrice()) + ")", HttpStatus.BAD_REQUEST);
                 }
             }
@@ -196,22 +250,61 @@ public class BillService {
         // Reconcile itemsSum with totalAmount if multiple items are provided
         if (request.getTotalAmount() != null && request.getItems().size() > 1) {
             if (Math.abs(itemsSum - request.getTotalAmount()) > 0.05) {
-                throw new ApiException("Sum of item prices (₹" + String.format("%.2f", itemsSum) +
-                        ") does not match bill total (₹" + String.format("%.2f", request.getTotalAmount()) + ")",
+                throw new ApiException("Sum of item prices (" + symbol + String.format("%.2f", itemsSum) +
+                        ") does not match bill total (" + symbol + String.format("%.2f", request.getTotalAmount()) + ")",
                         HttpStatus.BAD_REQUEST);
             }
         }
     }
 
+    public Bill normalizeBill(Bill bill) {
+        if (bill == null) return null;
+        if (bill.getCurrency() == null || bill.getCurrency().trim().isEmpty()) {
+            bill.setCurrency("INR");
+        } else {
+            bill.setCurrency(bill.getCurrency().trim().toUpperCase());
+        }
+        bill.setBaseCurrency("INR");
+        if ("INR".equalsIgnoreCase(bill.getCurrency())) {
+            if (bill.getExchangeRate() == null || bill.getExchangeRate() <= 0) {
+                bill.setExchangeRate(1.0);
+            }
+            if (bill.getConvertedAmount() == null) {
+                bill.setConvertedAmount(bill.getTotalAmount());
+            }
+        } else {
+            if (bill.getExchangeRate() == null || bill.getExchangeRate() <= 0) {
+                double rate = currencyConversionService.getExchangeRate(bill.getCurrency(), "INR");
+                bill.setExchangeRate(rate);
+            }
+            if (bill.getConvertedAmount() == null || bill.getConvertedAmount() <= 0) {
+                double total = bill.getTotalAmount() != null ? bill.getTotalAmount() : 0.0;
+                bill.setConvertedAmount(currencyConversionService.roundToTwoDecimals(total * bill.getExchangeRate()));
+            }
+        }
+        return bill;
+    }
+
     public List<Bill> getBillsByGroup(String groupId) {
         List<Bill> bills = billRepository.findByGroupId(groupId);
-        bills.sort((b1, b2) -> b2.getCreatedAt().compareTo(b1.getCreatedAt()));
-        return bills;
+        if (bills != null) {
+            bills.forEach(this::normalizeBill);
+            bills.sort((b1, b2) -> {
+                LocalDateTime t1 = b1.getCreatedAt();
+                LocalDateTime t2 = b2.getCreatedAt();
+                if (t1 == null && t2 == null) return 0;
+                if (t1 == null) return 1;
+                if (t2 == null) return -1;
+                return t2.compareTo(t1);
+            });
+        }
+        return bills != null ? bills : Collections.emptyList();
     }
 
     public Bill getBillById(String billId) {
-        return billRepository.findById(billId)
+        Bill bill = billRepository.findById(billId)
                 .orElseThrow(() -> new ApiException("Bill not found", HttpStatus.NOT_FOUND));
+        return normalizeBill(bill);
     }
 
     public Bill updateBill(String billId, CreateBillRequest request) {
@@ -246,6 +339,31 @@ public class BillService {
             bill.setReceiptUrl(request.getReceiptUrl());
         }
 
+        if (request.getCurrency() != null && !request.getCurrency().trim().isEmpty()) {
+            String newCurrency = currencyConversionService.validateAndNormalizeCurrency(request.getCurrency());
+            bill.setCurrency(newCurrency);
+        }
+        bill.setBaseCurrency("INR");
+
+        if (request.getExchangeRate() != null && request.getExchangeRate() > 0) {
+            bill.setExchangeRate(request.getExchangeRate());
+            bill.setExchangeRateDate(LocalDateTime.now(ZoneOffset.UTC));
+        } else if ("INR".equalsIgnoreCase(bill.getCurrency())) {
+            bill.setExchangeRate(1.0);
+            bill.setExchangeRateDate(LocalDateTime.now(ZoneOffset.UTC));
+        } else if (bill.getExchangeRate() == null || bill.getExchangeRate() <= 0) {
+            bill.setExchangeRate(currencyConversionService.getExchangeRate(bill.getCurrency(), "INR"));
+            bill.setExchangeRateDate(LocalDateTime.now(ZoneOffset.UTC));
+        }
+
+        // Category
+        if (request.getCategory() != null && !request.getCategory().trim().isEmpty()) {
+            bill.setCategory(request.getCategory().trim());
+        }
+
+        double rate = bill.getExchangeRate() != null && bill.getExchangeRate() > 0 ? bill.getExchangeRate() : 1.0;
+        bill.setConvertedAmount(currencyConversionService.roundToTwoDecimals(bill.getTotalAmount() * rate));
+
         return billRepository.save(bill);
     }
 
@@ -268,9 +386,17 @@ public class BillService {
                 allBills.add(bill);
             }
         }
+        allBills.forEach(this::normalizeBill);
         
-        // Sort by date (most recent first)
-        allBills.sort((b1, b2) -> b2.getCreatedAt().compareTo(b1.getCreatedAt()));
+        // Sort by date (most recent first, null-safe)
+        allBills.sort((b1, b2) -> {
+            LocalDateTime t1 = b1.getCreatedAt();
+            LocalDateTime t2 = b2.getCreatedAt();
+            if (t1 == null && t2 == null) return 0;
+            if (t1 == null) return 1;
+            if (t2 == null) return -1;
+            return t2.compareTo(t1);
+        });
         
         return allBills;
     }
@@ -284,8 +410,15 @@ public class BillService {
                 .filter(bill -> isFriendParticipant(bill, friendId))
                 .collect(Collectors.toList());
 
-        // Sort by createdAt descending
-        billsWithFriend.sort((b1, b2) -> b2.getCreatedAt().compareTo(b1.getCreatedAt()));
+        // Sort by createdAt descending (null-safe)
+        billsWithFriend.sort((b1, b2) -> {
+            LocalDateTime t1 = b1.getCreatedAt();
+            LocalDateTime t2 = b2.getCreatedAt();
+            if (t1 == null && t2 == null) return 0;
+            if (t1 == null) return 1;
+            if (t2 == null) return -1;
+            return t2.compareTo(t1);
+        });
 
         return billsWithFriend;
     }

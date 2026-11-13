@@ -1,8 +1,19 @@
 HELP.md
 target/
+build/
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
+
+# Local build, compiler & JVM arg dumps
+*_args*.txt
+*sources*.txt
+classpath.txt
+javac_args.txt
+test_args.txt
+compile_*.cmd
+*.log
+*.tmp
 
 ### STS ###
 .apt_generated
@@ -25,14 +36,9 @@ target/
 /dist/
 /nbdist/
 /.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
 
 ### VS Code ###
 .vscode/
 
-# Application properties with real credentials - use application-local.properties
-# for local dev (activated via SPRING_PROFILES_ACTIVE=local). The main
-# application.properties only contains ${ENV_VAR} placeholders and is safe to commit.
+# Local credentials
 src/main/resources/application-local.properties

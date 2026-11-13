@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 
 /**
@@ -38,6 +39,24 @@ public class ActivityService {
     public void logActivity(String userId, String type, String description,
                             String relatedGroupId, String relatedBillId,
                             String actorUserId) {
+        logActivity(userId, type, description, relatedGroupId, relatedBillId, actorUserId, null, null);
+    }
+
+    /**
+     * Creates and saves an Activity record with optional groupName and amount.
+     *
+     * @param userId         the user this activity belongs to (feed owner)
+     * @param type           activity type, e.g. "GROUP_CREATED", "EXPENSE_ADDED", "EXPENSE_SETTLED"
+     * @param description    human-readable text, e.g. "Mehr paid Vraj"
+     * @param relatedGroupId group id this relates to (nullable)
+     * @param relatedBillId  bill id this relates to (nullable)
+     * @param actorUserId    who performed the action (nullable; defaults to userId)
+     * @param groupName      name of the group (nullable)
+     * @param amount         settlement or expense amount (nullable)
+     */
+    public void logActivity(String userId, String type, String description,
+                            String relatedGroupId, String relatedBillId,
+                            String actorUserId, String groupName, Double amount) {
         try {
             Activity activity = new Activity();
             activity.setUserId(userId);
@@ -46,10 +65,13 @@ public class ActivityService {
             activity.setRelatedGroupId(relatedGroupId);
             activity.setRelatedBillId(relatedBillId);
             activity.setActorUserId(actorUserId != null ? actorUserId : userId);
-            activity.setCreatedAt(LocalDateTime.now());
+            activity.setGroupName(groupName);
+            activity.setAmount(amount);
+            activity.setCreatedAt(LocalDateTime.now(ZoneOffset.UTC));
 
             activityRepository.save(activity);
-            log.debug("Logged activity: type={}, userId={}, actor={}", type, userId, activity.getActorUserId());
+            log.debug("Logged activity: type={}, userId={}, actor={}, group={}, amount={}",
+                    type, userId, activity.getActorUserId(), groupName, amount);
         } catch (Exception e) {
             // Never let activity logging break the main business flow
             log.error("Failed to log activity: type={}, userId={}", type, userId, e);

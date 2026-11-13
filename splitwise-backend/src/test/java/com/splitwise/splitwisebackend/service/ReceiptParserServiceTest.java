@@ -722,4 +722,382 @@ class ReceiptParserServiceTest {
             assertEquals(-50.00, parser.parseMoney("-50.00"), 0.01);
         }
     }
+
+    // ====================================================================
+    // Regression Suite - The Tack Room & Financial Pipeline Validation
+    // ====================================================================
+    @Nested
+    @DisplayName("The Tack Room Regression Suite")
+    class TheTackRoomRegressionSuite {
+
+        private static final String TACK_ROOM_OCR = """
+                The Tack Room
+                145 Lincoln Road
+                Lincoln, MA 01773
+
+                Server: Griffin F
+
+                Check #36                         Table 59
+                Ordered:                    4/8/24 7:13 PM
+                1 BBQ Potato Chips                   $7.00
+                1 Diet Coke                          $3.00
+                1 Trillium Fort Point               $10.00
+                2 Fried Chicken Sandwich         $34.00
+                1 Famous Duck Grilled Cheese        $25.00
+                1 Mac & Cheese                      $17.00
+                1 Burger of the moment          $18.00
+                Subtotal                           $114.00
+                Admin Fee (3.00%)                    $3.42
+                Tax                                   $7.11
+                Total                              $124.53
+
+                Add us on Instagram: Tackroomlincoln
+                """;
+
+        @Test
+        @DisplayName("1. The attached receipt parses into correct merchant, 7 items, subtotal, admin fee, tax, and total")
+        void test1_AttachedReceiptCompletePipeline() {
+            ReceiptParseResult result = parser.parseReceiptText(TACK_ROOM_OCR);
+
+            assertEquals("The Tack Room", result.getSuggestedTitle());
+            assertEquals("USD", result.getCurrency());
+            assertEquals(114.00, result.getSubtotal(), 0.001);
+            assertEquals(3.42, result.getServiceCharge(), 0.001);
+            assertEquals(7.11, result.getTax(), 0.001);
+            assertEquals(124.53, result.getTotalAmount(), 0.001);
+
+            assertEquals(7, result.getItems().size());
+            assertEquals("VALIDATED", result.getValidationStatus());
+            assertEquals("HIGH", result.getConfidence());
+        }
+
+        @Test
+        @DisplayName("2. Merchant-name extraction rejects OCR noise (T_T, ET) and extracts genuine title")
+        void test2_MerchantNameExtraction() {
+            String noisyHeaderOcr = """
+                    T_T
+                    The Tack Room
+                    145 Lincoln Road
+                    Lincoln, MA 01773
+                    Server: Griffin F
+                    Check #36 Table 59
+                    1 BBQ Potato Chips $7.00
+                    Subtotal $7.00
+                    Total $7.00
+                    """;
+            ReceiptParseResult result = parser.parseReceiptText(noisyHeaderOcr);
+            assertEquals("The Tack Room", result.getSuggestedTitle(), "Noise like T_T must not be chosen over genuine title");
+        }
+
+        @Test
+        @DisplayName("3. Seven-item extraction and quantity handling (8 total units, Fried Chicken Sandwich qty=2, unitPrice=17.00)")
+        void test3_SevenItemExtractionAndQuantityHandling() {
+            ReceiptParseResult result = parser.parseReceiptText(TACK_ROOM_OCR);
+            List<BillItemRequest> items = result.getItems();
+
+            assertEquals(7, items.size(), "Must contain exactly 7 purchased line items");
+
+            // Verify item 1
+            assertEquals("BBQ Potato Chips", items.get(0).getName());
+            assertEquals(1.0, items.get(0).getQuantity(), 0.001);
+            assertEquals(7.00, items.get(0).getPrice(), 0.001);
+
+            // Verify item 2
+            assertEquals("Diet Coke", items.get(1).getName());
+            assertEquals(1.0, items.get(1).getQuantity(), 0.001);
+            assertEquals(3.00, items.get(1).getPrice(), 0.001);
+
+            // Verify item 3
+            assertEquals("Trillium Fort Point", items.get(2).getName());
+            assertEquals(1.0, items.get(2).getQuantity(), 0.001);
+            assertEquals(10.00, items.get(2).getPrice(), 0.001);
+
+            // Verify item 4: Fried Chicken Sandwich (Qty 2, line total $34.00, unit $17.00)
+            assertEquals("Fried Chicken Sandwich", items.get(3).getName());
+            assertEquals(2.0, items.get(3).getQuantity(), 0.001);
+            assertEquals(34.00, items.get(3).getPrice(), 0.001);
+            assertEquals(17.00, items.get(3).getUnitPrice(), 0.001);
+
+            // Verify item 5: Famous Duck Grilled Cheese
+            assertEquals("Famous Duck Grilled Cheese", items.get(4).getName());
+            assertEquals(1.0, items.get(4).getQuantity(), 0.001);
+            assertEquals(25.00, items.get(4).getPrice(), 0.001);
+
+            // Verify item 6: Mac & Cheese
+            assertEquals("Mac & Cheese", items.get(5).getName());
+            assertEquals(1.0, items.get(5).getQuantity(), 0.001);
+            assertEquals(17.00, items.get(5).getPrice(), 0.001);
+
+            // Verify item 7: Burger of the moment
+            assertEquals("Burger of the moment", items.get(6).getName());
+            assertEquals(1.0, items.get(6).getQuantity(), 0.001);
+            assertEquals(18.00, items.get(6).getPrice(), 0.001);
+
+            // Total units = 1 + 1 + 1 + 2 + 1 + 1 + 1 = 8
+            double totalUnits = items.stream().mapToDouble(i -> i.getQuantity() != null ? i.getQuantity() : 1.0).sum();
+            assertEquals(8.0, totalUnits, 0.001, "Total units must equal 8");
+
+            // Sum of item prices = 114.00 (not doubled)
+            double itemSum = items.stream().mapToDouble(BillItemRequest::getPrice).sum();
+            assertEquals(114.00, itemSum, 0.001, "Sum of items must be $114.00");
+        }
+
+        @Test
+        @DisplayName("4. Admin Fee (3%) is classified as service charge and NOT as a purchased item")
+        void test4_AdminFeeClassification() {
+            ReceiptParseResult result = parser.parseReceiptText(TACK_ROOM_OCR);
+
+            assertEquals(3.42, result.getServiceCharge(), 0.001, "Admin Fee must be classified under serviceCharge");
+            for (BillItemRequest item : result.getItems()) {
+                assertFalse(item.getName().toLowerCase().contains("admin fee"), "Admin Fee must NOT be in purchased items list");
+                assertFalse(item.getName().toLowerCase().contains("fee"), "Fees must NOT be in purchased items list");
+            }
+        }
+
+        @Test
+        @DisplayName("5. Subtotal ($114.00), tax ($7.11), and final-total ($124.53) extraction")
+        void test5_SubtotalTaxAndFinalTotalExtraction() {
+            ReceiptParseResult result = parser.parseReceiptText(TACK_ROOM_OCR);
+
+            assertEquals(114.00, result.getSubtotal(), 0.001);
+            assertEquals(7.11, result.getTax(), 0.001);
+            assertEquals(124.53, result.getTotalAmount(), 0.001);
+        }
+
+        @Test
+        @DisplayName("6. Correct financial validation (114.00 + 7.11 + 3.42 = 124.53) passes without suppressing errors")
+        void test6_CorrectFinancialValidation() {
+            ReceiptParseResult result = parser.parseReceiptText(TACK_ROOM_OCR);
+
+            assertEquals("VALIDATED", result.getValidationStatus());
+            assertNotNull(result.getValidationMessage());
+            assertTrue(result.getValidationMessage().contains("mathematically validated"));
+        }
+
+        @Test
+        @DisplayName("7. USD preservation across all fields")
+        void test7_UsdPreservation() {
+            ReceiptParseResult result = parser.parseReceiptText(TACK_ROOM_OCR);
+
+            assertEquals("USD", result.getCurrency(), "Currency must be detected and preserved as USD");
+            assertTrue(result.getValidationMessage().contains("$"), "Validation message should format in USD ($)");
+        }
+
+        @Test
+        @DisplayName("8. Receipts without service charges validate correctly (Subtotal + Tax = Total)")
+        void test8_ReceiptWithoutServiceCharges() {
+            String ocr = """
+                    STARBUCKS
+                    1 Caffè Latte  $5.50
+                    1 Croissant    $4.00
+                    Subtotal       $9.50
+                    Tax            $0.76
+                    Total         $10.26
+                    """;
+            ReceiptParseResult result = parser.parseReceiptText(ocr);
+
+            assertEquals("USD", result.getCurrency());
+            assertEquals(9.50, result.getSubtotal(), 0.001);
+            assertNull(result.getServiceCharge());
+            assertEquals(0.76, result.getTax(), 0.001);
+            assertEquals(10.26, result.getTotalAmount(), 0.001);
+            assertEquals(2, result.getItems().size());
+            assertEquals("VALIDATED", result.getValidationStatus());
+        }
+
+        @Test
+        @DisplayName("9. Receipts with multiple fees and discounts validate correctly")
+        void test9_ReceiptWithMultipleFeesAndDiscounts() {
+            String ocr = """
+                    BISTRO GOURMET
+                    1 Steak Frites  45.00
+                    1 Wine Glass    15.00
+                    Subtotal        60.00
+                    Discount        -5.00
+                    Admin Fee        2.00
+                    Tax              4.40
+                    Tip             10.00
+                    Total           71.40
+                    """;
+            ReceiptParseResult result = parser.parseReceiptText(ocr);
+
+            assertEquals(60.00, result.getSubtotal(), 0.001);
+            assertEquals(5.00, Math.abs(result.getDiscount()), 0.001);
+            assertEquals(2.00, result.getServiceCharge(), 0.001);
+            assertEquals(4.40, result.getTax(), 0.001);
+            assertEquals(10.00, result.getTip(), 0.001);
+            assertEquals(71.40, result.getTotalAmount(), 0.001);
+            assertEquals("VALIDATED", result.getValidationStatus(),
+                    "Equation: 60 - 5 + 2 + 4.40 + 10 = 71.40 must be VALIDATED");
+        }
+
+        @Test
+        @DisplayName("10. Genuine financial mismatches still produce FAILED_VALIDATION warning")
+        void test10_GenuineFinancialMismatch() {
+            String mismatchOcr = """
+                    THE TACK ROOM
+                    1 BBQ Potato Chips $7.00
+                    Subtotal $114.00
+                    Admin Fee (3.00%) $3.42
+                    Tax $7.11
+                    Total $150.00
+                    """;
+            ReceiptParseResult result = parser.parseReceiptText(mismatchOcr);
+
+            assertEquals("FAILED_VALIDATION", result.getValidationStatus(),
+                    "Total 150.00 != 114.00 + 3.42 + 7.11 (124.53) must produce FAILED_VALIDATION");
+            assertEquals("LOW", result.getConfidence());
+            assertTrue(result.getValidationMessage().contains("does not match"));
+        }
+    }
+
+    // ====================================================================
+    // Part 2 Acceptance Suite (Phase G Regression Tests)
+    // ====================================================================
+    @Nested
+    @DisplayName("Part 2 Acceptance Suite")
+    class Part2AcceptanceSuite {
+
+        @Test
+        @DisplayName("TEST 1 - USD Receipt: subtotal $108.50, tax $7.87, total $116.37 recognized in USD")
+        void test1_UsdReceiptFixture() {
+            String ocr = """
+                    THE BLUE CRAB SEAFOOD
+                    104 Ocean Drive, Miami, FL 33139
+                    Date: 10/24/2026 19:45
+                    Server: Alex Table: 12 Guests: 3
+                    
+                    ITEM QTY PRICE TOTAL
+                    Grilled Salmon Fillet  1  42.00  42.00
+                    Prime Ribeye Steak  1  48.50  48.50
+                    Craft Draft Beer  2  9.00  18.00
+                    
+                    Subtotal: $108.50
+                    Total Tax: $7.87
+                    Total: $116.37
+                    Order Balance due: $116.37
+                    Thank you for dining with us!
+                    """;
+
+            ReceiptParseResult result = parser.parseReceiptText(ocr);
+
+            assertEquals("USD", result.getCurrency(), "Receipt denomination must be detected as USD, not INR");
+            assertEquals(108.50, result.getSubtotal(), 0.01, "Printed subtotal must be 108.50");
+            assertEquals(7.87, result.getTax(), 0.01, "Tax must be 7.87");
+            assertEquals(116.37, result.getTotalAmount(), 0.01, "Total amount must be 116.37");
+            assertEquals(3, result.getItems().size(), "Must extract exactly 3 purchased items");
+            assertEquals("VALIDATED", result.getValidationStatus(), "Financial equation (108.50 + 7.87 = 116.37) must be VALIDATED");
+            assertEquals("HIGH", result.getConfidence());
+
+            // Check that items do not contain headers or metadata
+            for (BillItemRequest item : result.getItems()) {
+                assertFalse(item.getName().equalsIgnoreCase("ITEM"));
+                assertFalse(item.getName().toLowerCase().contains("subtotal"));
+                assertFalse(item.getName().toLowerCase().contains("tax"));
+                assertFalse(item.getName().toLowerCase().contains("order balance"));
+            }
+        }
+
+        @Test
+        @DisplayName("TEST 2 - Receipt Items: Extracts genuine items, ignores column headers, metadata, footers")
+        void test2_ReceiptItemsClassificationAndExtraction() {
+            String ocr = """
+                    BELLA ITALIA
+                    Eat In - Table 7 - Server: Marco
+                    Order #: 98124  Time: 20:15
+                    
+                    SR NO. ITEM DESCRIPTION QTY PRICE AMOUNT
+                    1. Wood Fired Margherita Pizza  1  16.50  16.50
+                    2. Creamy Fettuccine Alfredo with Truffle  1  24.00  24.00
+                    3. Sparkling Mineral Water Large  2  4.50  9.00
+                    
+                    Promotional: Sign up for our rewards club!
+                    Subtotal  49.50
+                    Sales Tax  4.20
+                    Total Due  53.70
+                    """;
+
+            ReceiptParseResult result = parser.parseReceiptText(ocr);
+
+            assertEquals(3, result.getItems().size());
+            assertEquals("Wood Fired Margherita Pizza", result.getItems().get(0).getName());
+            assertEquals(16.50, result.getItems().get(0).getPrice(), 0.01);
+            assertEquals("Creamy Fettuccine Alfredo with Truffle", result.getItems().get(1).getName());
+            assertEquals(24.00, result.getItems().get(1).getPrice(), 0.01);
+            assertEquals("Sparkling Mineral Water Large", result.getItems().get(2).getName());
+            assertEquals(9.00, result.getItems().get(2).getPrice(), 0.01);
+            assertEquals(53.70, result.getTotalAmount(), 0.01);
+        }
+
+        @Test
+        @DisplayName("TEST 3 - Disagreement between item sum and printed subtotal produces warning without rewriting")
+        void test3_ItemSubtotalDiscrepancy() {
+            String ocr = """
+                    RESTAURANT
+                    Burger  15.00
+                    Subtotal  108.50
+                    Total Tax  7.87
+                    Total  116.37
+                    """;
+
+            ReceiptParseResult result = parser.parseReceiptText(ocr);
+
+            // Subtotal must remain what was printed (108.50), NOT rewritten to 15.00!
+            assertEquals(108.50, result.getSubtotal(), 0.01);
+            assertEquals(116.37, result.getTotalAmount(), 0.01);
+            assertEquals(1, result.getItems().size());
+            assertEquals(15.00, result.getItems().get(0).getPrice(), 0.01);
+
+            // Validation status must be PARTIALLY_VALIDATED with clear discrepancy warning
+            assertEquals("PARTIALLY_VALIDATED", result.getValidationStatus());
+            assertTrue(result.getValidationMessage().contains("differs slightly") || result.getValidationMessage().contains("differs"));
+        }
+
+        @Test
+        @DisplayName("TEST 4 - Financial validation matches valid equation and flags mismatch")
+        void test4_FinancialValidationCases() {
+            // Case A: Valid equation passes
+            String validOcr = """
+                    CAFE
+                    Item 1  100.00
+                    Subtotal  100.00
+                    Tax  8.00
+                    Total  108.00
+                    """;
+            ReceiptParseResult validResult = parser.parseReceiptText(validOcr);
+            assertEquals("VALIDATED", validResult.getValidationStatus());
+
+            // Case B: Mismatched equation fails validation
+            String mismatchOcr = """
+                    CAFE
+                    Item 1  100.00
+                    Subtotal  100.00
+                    Tax  8.00
+                    Total  150.00
+                    """;
+            ReceiptParseResult mismatchResult = parser.parseReceiptText(mismatchOcr);
+            assertEquals("FAILED_VALIDATION", mismatchResult.getValidationStatus());
+            assertEquals("LOW", mismatchResult.getConfidence(), "Confidence must be LOW when financial validation fails");
+            assertTrue(mismatchResult.getValidationMessage().contains("does not match"));
+        }
+
+        @Test
+        @DisplayName("TEST 5 - Corrupted OCR receipt total (SR ical:) is never classified as a purchased item")
+        void test5_CorruptedOcrTotalSectionNotClassifiedAsPurchasedItem() {
+            String ocr = """
+                    TACO HAVEN
+                    Taco Platter  15.00
+                    SR ical: 108.50
+                    Total Tax  7.87
+                    Order Balance due: 116.37
+                    """;
+
+            ReceiptParseResult result = parser.parseReceiptText(ocr);
+
+            assertEquals(1, result.getItems().size(), "Only Taco Platter should be an item, not 'SR ical:' or 'Order Balance due:'");
+            assertEquals("Taco Platter", result.getItems().get(0).getName());
+            assertEquals(108.50, result.getSubtotal(), 0.01);
+            assertEquals(116.37, result.getTotalAmount(), 0.01);
+        }
+    }
 }

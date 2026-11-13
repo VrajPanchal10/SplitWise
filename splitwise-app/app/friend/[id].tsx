@@ -1,26 +1,36 @@
-import { useState, useCallback } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Alert } from 'react-native';
-import { ChevronLeft, Receipt, UtensilsCrossed, Car, Film, CheckCircle2, BellRing } from 'lucide-react-native';
+import { useState, useCallback, useEffect } from 'react';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Alert, Modal, RefreshControl, DeviceEventEmitter } from 'react-native';
+import { ChevronLeft, ChevronDown, Receipt, UtensilsCrossed, Car, Film, CheckCircle2, BellRing } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
 import { ZigzagEdge } from '@/components/ZigzagEdge';
 import { useRouter, useLocalSearchParams, useFocusEffect } from 'expo-router';
 import { useAuth } from '../../context/AuthContext';
 import apiClient from '../../services/apiClient';
+import { formatDate, formatDateTime } from '../../utils/dateUtils';
+import { formatMoney, getCurrencySymbol } from '@/constants/currencies';
+import { getCategoryByKey } from '@/constants/categories';
 
 interface BillItem {
   name: string;
   price: number;
   sharedByUserIds: string[];
+  customShares?: { [userId: string]: number };
 }
 
 interface Bill {
   id: string;
   title: string;
   totalAmount: number;
+  currency?: string;
+  baseCurrency?: string;
+  exchangeRate?: number;
+  exchangeRateDate?: string;
+  convertedAmount?: number;
   groupId: string | null;
   paidBy: string;
   items: BillItem[];
   createdAt: string;
+  category?: string;
 }
 
 interface FriendBalance {
@@ -32,6 +42,7 @@ interface BillWithShare extends Bill {
   friendShare: number;
   direction: 'owe' | 'owed' | 'settled';
   shareAmount: number;
+  convertedShareAmount: number;
 }
 
 const getCategoryConfig = (category: string) => {
@@ -49,13 +60,20 @@ const getCategoryConfig = (category: string) => {
 
 /**
  * Calculates a user's share of a bill by summing each item's price divided
- * by the number of UNIQUE participants in that item's sharedByUserIds.
+ * by the number of UNIQUE participants in that item's sharedByUserIds,
+ * or using customShares if defined.
  */
 const calculateUserShare = (bill: Bill, userId: string): number => {
   if (!bill.items || bill.items.length === 0) return 0;
 
   let totalShare = 0;
   for (const item of bill.items) {
+    if (!item) continue;
+    if (item.customShares && item.customShares[userId] !== undefined) {
+      totalShare += item.customShares[userId];
+      continue;
+    }
+
     if (!item.sharedByUserIds || item.sharedByUserIds.length === 0) continue;
 
     // De-duplicate sharedByUserIds to avoid inflating the split count
@@ -63,7 +81,7 @@ const calculateUserShare = (bill: Bill, userId: string): number => {
     if (uniqueSharedBy.length === 0) continue;
 
     if (uniqueSharedBy.includes(userId)) {
-      totalShare += item.price / uniqueSharedBy.length;
+      totalShare += (item.price || 0) / uniqueSharedBy.length;
     }
   }
   return totalShare;
@@ -71,15 +89,21 @@ const calculateUserShare = (bill: Bill, userId: string): number => {
 
 const BillRow: React.FC<{ bill: BillWithShare; friendName: string }> = ({ bill, friendName }) => {
   const router = useRouter();
-  const config = getCategoryConfig('food');
-  const Icon = config.icon;
+  const catConfig = getCategoryByKey(bill.category || 'other');
+  const billCurrency = bill.currency || 'INR';
+  const baseCurrency = bill.baseCurrency || 'INR';
+  const isForeign = billCurrency !== baseCurrency && !!bill.exchangeRate && bill.exchangeRate !== 1;
 
   const getShareLabel = () => {
+    const convertedShare = bill.convertedShareAmount ?? bill.shareAmount;
+    const formattedConvertedShare = '₹' + convertedShare.toFixed(2);
+    const foreignShareInfo = isForeign ? ` (${formatMoney(bill.shareAmount, billCurrency)})` : '';
+
     if (bill.direction === 'owe') {
-      return `You owe ₹${bill.shareAmount.toFixed(2)}`;
+      return `You owe ${formattedConvertedShare}${foreignShareInfo}`;
     }
     if (bill.direction === 'owed') {
-      return `${friendName} owes ₹${bill.shareAmount.toFixed(2)}`;
+      return `${friendName} owes ${formattedConvertedShare}${foreignShareInfo}`;
     }
     return 'Settled up';
   };
@@ -94,21 +118,31 @@ const BillRow: React.FC<{ bill: BillWithShare; friendName: string }> = ({ bill, 
     <TouchableOpacity
       style={styles.billItem}
       activeOpacity={0.7}
-      onPress={() =>
+      onPress={() => {
+        if (!bill.id) return;
         router.push({
           pathname: '/bill/[id]',
           params: { id: bill.id },
-        })
-      }>
-      <View style={[styles.billIconContainer, { backgroundColor: config.tint }]}>
-        <Icon size={18} color={config.color} />
+        });
+      }}>
+      <View style={[styles.billIconContainer, { backgroundColor: catConfig.tint }]}>
+        <Text style={{ fontSize: 16 }}>{catConfig.emoji}</Text>
       </View>
       <View style={styles.billInfo}>
         <Text style={styles.billName} numberOfLines={1}>{bill.title}</Text>
-        <Text style={styles.billDate}>{new Date(bill.createdAt).toLocaleDateString()}</Text>
+        <Text style={styles.billDate}>{formatDate(bill.createdAt)}</Text>
         <Text style={[styles.billShare, { color: getShareColor() }]}>{getShareLabel()}</Text>
       </View>
-      <Text style={styles.billAmount}>₹{bill.totalAmount.toLocaleString()}</Text>
+      <View style={styles.billAmountContainer}>
+        <Text style={styles.billAmount}>
+          {formatMoney(bill.totalAmount, billCurrency, true)}
+        </Text>
+        {isForeign && (
+          <Text style={styles.billConvertedAmount}>
+            ≈ {formatMoney(bill.convertedAmount || (bill.totalAmount * (bill.exchangeRate || 1)), baseCurrency)}
+          </Text>
+        )}
+      </View>
     </TouchableOpacity>
   );
 };
@@ -116,51 +150,78 @@ const BillRow: React.FC<{ bill: BillWithShare; friendName: string }> = ({ bill, 
 export default function FriendDetailScreen() {
   const router = useRouter();
   const params = useLocalSearchParams();
-  const friendId = params.id as string;
-  const friendNameParam = params.name as string | undefined;
+  const rawId = params.id;
+  const friendId = (Array.isArray(rawId) ? rawId[0] : (rawId as string)) || '';
+  const rawName = params.name;
+  const friendNameParam = (Array.isArray(rawName) ? rawName[0] : (rawName as string | undefined));
   const { user } = useAuth();
 
   const [friendName, setFriendName] = useState<string>(friendNameParam || 'Friend');
   const [netBalance, setNetBalance] = useState<number | null>(null);
   const [bills, setBills] = useState<BillWithShare[]>([]);
+  const [paidSettlements, setPaidSettlements] = useState<any[]>([]);
+  const [groupNames, setGroupNames] = useState<{ [id: string]: string }>({});
+  const [isSettlementHistoryExpanded, setIsSettlementHistoryExpanded] = useState<boolean>(true);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSettling, setIsSettling] = useState(false);
   const [settleModalVisible, setSettleModalVisible] = useState(false);
+  const [lastSettledAmount, setLastSettledAmount] = useState<number | null>(null);
 
-  const fetchFriendData = useCallback(async () => {
+  const fetchFriendData = useCallback(async (isSilent = false) => {
     if (!friendId || !user) return;
 
-    try {
+    if (!isSilent && bills.length === 0) {
       setIsLoading(true);
+    }
 
-      // 1. Fetch friend's name if not passed via route params
-      if (!friendNameParam) {
-        try {
-          const userResponse = await apiClient.get(`/users/${friendId}`);
-          setFriendName(userResponse.data.fullName || 'Friend');
-        } catch (error) {
-          console.error('Error fetching friend name:', error);
-        }
+    try {
+      // Parallelize all friend data requests
+      const [userRes, balancesRes, groupsRes, settlementsRes, billsRes] = await Promise.all([
+        !friendNameParam
+          ? apiClient.get(`/users/${friendId}`).catch(err => {
+              console.error('Error fetching friend name:', err);
+              return { data: null };
+            })
+          : Promise.resolve({ data: null }),
+        apiClient.get('/users/me/friend-balances').catch(err => {
+          console.error('Error fetching friend balances:', err);
+          return { data: [] };
+        }),
+        apiClient.get('/groups').catch(err => {
+          console.error('Error fetching groups for friend screen:', err);
+          return { data: [] };
+        }),
+        apiClient.get(`/settlements/friend/${friendId}`).catch(err => {
+          console.error('Error fetching settlements with friend:', err);
+          return { data: [] };
+        }),
+        apiClient.get(`/bills/with-friend/${friendId}`).catch(err => {
+          console.error('Error fetching bills with friend:', err);
+          return { data: [] };
+        }),
+      ]);
+
+      if (userRes.data?.fullName) {
+        setFriendName(userRes.data.fullName);
       }
 
-      // 2. Fetch friend balances and filter for this specific friend
-      try {
-        const balancesResponse = await apiClient.get('/users/me/friend-balances');
-        const balances: FriendBalance[] = balancesResponse.data;
-        const friendBalance = balances.find(
-          (b) => b.friendId === friendId || (b as any).friend_id === friendId
-        );
-        setNetBalance(friendBalance ? friendBalance.netBalance ?? (friendBalance as any).net_balance ?? 0 : 0);
-      } catch (error) {
-        console.error('Error fetching friend balances:', error);
-        setNetBalance(0);
-      }
+      const balances: FriendBalance[] = balancesRes.data || [];
+      const friendBalance = balances.find(
+        (b) => (b.friendId === friendId || (b as any).friend_id === friendId)
+      );
+      const bal = friendBalance ? (friendBalance.netBalance ?? (friendBalance as any).net_balance ?? 0) : 0;
+      setNetBalance(bal);
 
-      // 3. Fetch all bills shared with this friend
-      const billsResponse = await apiClient.get(`/bills/with-friend/${friendId}`);
-      const billsData: Bill[] = billsResponse.data;
+      const gMap: { [id: string]: string } = {};
+      (groupsRes.data || []).forEach((g: any) => {
+        gMap[g.id] = g.name;
+      });
+      setGroupNames(gMap);
 
-      // 4. Compute each bill's friend share and direction
+      setPaidSettlements(settlementsRes.data || []);
+
+      const billsData: Bill[] = Array.isArray(billsRes.data) ? billsRes.data : [];
       const billsWithShare: BillWithShare[] = billsData.map((bill) => {
         const friendShare = calculateUserShare(bill, friendId);
         const userShare = calculateUserShare(bill, user.id);
@@ -169,15 +230,12 @@ export default function FriendDetailScreen() {
         let shareAmount: number;
 
         if (bill.paidBy === user.id) {
-          // I paid — friend owes me their share
           direction = friendShare > 0.005 ? 'owed' : 'settled';
           shareAmount = friendShare;
         } else if (bill.paidBy === friendId) {
-          // Friend paid — I owe them my share
           direction = userShare > 0.005 ? 'owe' : 'settled';
           shareAmount = userShare;
         } else {
-          // Someone else paid — net between us
           const net = friendShare - userShare;
           if (Math.abs(net) <= 0.005) {
             direction = 'settled';
@@ -191,7 +249,10 @@ export default function FriendDetailScreen() {
           }
         }
 
-        return { ...bill, friendShare, direction, shareAmount };
+        const rate = (bill.exchangeRate && bill.exchangeRate > 0) ? bill.exchangeRate : 1.0;
+        const convertedShareAmount = Math.round(shareAmount * rate * 100) / 100;
+
+        return { ...bill, friendShare, direction, shareAmount, convertedShareAmount };
       });
 
       setBills(billsWithShare);
@@ -200,13 +261,49 @@ export default function FriendDetailScreen() {
     } finally {
       setIsLoading(false);
     }
-  }, [friendId, user, friendNameParam]);
+  }, [friendId, user, friendNameParam, bills.length]);
 
+  const onRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    await fetchFriendData(true);
+    setIsRefreshing(false);
+  }, [fetchFriendData]);
+
+  // Sync on screen focus + periodic background sync (every 6s) while active
   useFocusEffect(
     useCallback(() => {
-      fetchFriendData();
+      fetchFriendData(true);
+
+      const interval = setInterval(() => {
+        fetchFriendData(true);
+      }, 6000);
+
+      return () => clearInterval(interval);
     }, [fetchFriendData])
   );
+
+  // Listen for instant mutations from bill creation or settlements
+  useEffect(() => {
+    const billCreatedSub = DeviceEventEmitter.addListener('bill:created', () => {
+      fetchFriendData(true);
+    });
+    const billUpdatedSub = DeviceEventEmitter.addListener('bill:updated', () => {
+      fetchFriendData(true);
+    });
+    const settlementSub = DeviceEventEmitter.addListener('settlement:recorded', () => {
+      fetchFriendData(true);
+    });
+    const billDeletedSub = DeviceEventEmitter.addListener('bill:deleted', () => {
+      fetchFriendData(true);
+    });
+
+    return () => {
+      billCreatedSub.remove();
+      billUpdatedSub.remove();
+      settlementSub.remove();
+      billDeletedSub.remove();
+    };
+  }, [fetchFriendData]);
 
   const handleSettleUp = () => {
     if (netBalance === null || Math.abs(netBalance) <= 0.005) return;
@@ -216,10 +313,14 @@ export default function FriendDetailScreen() {
   const handleConfirmSettle = async () => {
     try {
       setIsSettling(true);
+      const settledAmount = Math.abs(netBalance || 0);
       await apiClient.post(`/settlements/settle-with-friend/${friendId}`);
+      setLastSettledAmount(settledAmount);
       setSettleModalVisible(false);
-      // Refresh data to reflect the new settled state
-      fetchFriendData();
+      // Immediately reflect 0 balance locally, emit settlement event, then revalidate with server
+      setNetBalance(0);
+      DeviceEventEmitter.emit('settlement:recorded', { friendId });
+      await fetchFriendData(true);
     } catch (error: any) {
       console.error('Error settling up:', error);
       Alert.alert(
@@ -243,19 +344,10 @@ export default function FriendDetailScreen() {
     );
   }
 
-  const getBalanceText = () => {
-    if (netBalance === null) return 'Loading...';
-    if (netBalance > 0.005) return `${friendName} → You`;
-    if (netBalance < -0.005) return `You → ${friendName}`;
-    return "All shared expenses are settled.";
-  };
-
-  const getBalanceColor = () => {
-    if (netBalance === null) return theme.colors.cream;
-    if (netBalance > 0.005) return theme.colors.success;
-    if (netBalance < -0.005) return theme.colors.danger;
-    return theme.colors.heroMuted;
-  };
+  const isSettled = netBalance !== null && Math.abs(netBalance) <= 0.005;
+  const contributingBills = bills.filter(
+    (b) => b.direction === (netBalance && netBalance > 0 ? 'owed' : 'owe')
+  );
 
   return (
     <View style={styles.container}>
@@ -275,27 +367,37 @@ export default function FriendDetailScreen() {
 
         {/* Balance Summary */}
         <View style={styles.heroBalance}>
-          {netBalance !== null && Math.abs(netBalance) <= 0.005 ? (
+          {isSettled ? (
             <View style={{ alignItems: 'center', gap: 4 }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                 <CheckCircle2 size={24} color={theme.colors.success} />
-                <Text style={[styles.balanceAmount, { color: theme.colors.success }]}>Settled</Text>
+                <Text style={[styles.balanceAmount, { color: theme.colors.success }]}>SETTLED</Text>
               </View>
-              <Text style={[styles.balanceAmount, { color: theme.colors.cream, fontSize: 20 }]}>₹0</Text>
-              <Text style={styles.balanceLabel}>All shared expenses are settled.</Text>
+              <Text style={[styles.balanceAmount, { color: theme.colors.cream, fontSize: 24 }]}>₹0</Text>
+              <Text style={styles.balanceLabel}>
+                {lastSettledAmount !== null
+                  ? `${friendName} has paid you ₹${lastSettledAmount.toFixed(2)}`
+                  : 'All shared expenses are settled.'}
+              </Text>
             </View>
           ) : (
             <View style={{ alignItems: 'center' }}>
-              <Text style={styles.balanceLabel}>{getBalanceText()}</Text>
-              <Text style={[styles.balanceAmount, { color: getBalanceColor() }]}>
-                {netBalance !== null ? `₹${Math.abs(netBalance).toFixed(2)}` : ''}
+              <Text style={styles.balanceLabel}>
+                {netBalance !== null && netBalance > 0.005 ? 'Owes you' : 'You owe'}
+              </Text>
+              <Text
+                style={[
+                  styles.balanceAmount,
+                  { color: netBalance !== null && netBalance > 0.005 ? theme.colors.success : theme.colors.danger },
+                ]}>
+                ₹{Math.abs(netBalance || 0).toFixed(2)}
               </Text>
             </View>
           )}
         </View>
 
         {/* Action Buttons */}
-        {netBalance !== null && Math.abs(netBalance) > 0.005 && (
+        {!isSettled && (
           <View style={styles.actionButtons}>
             <TouchableOpacity
               style={[styles.settleButton, isSettling && styles.buttonDisabled]}
@@ -307,17 +409,19 @@ export default function FriendDetailScreen() {
               ) : (
                 <>
                   <CheckCircle2 size={18} color={theme.colors.heroBg} />
-                  <Text style={styles.settleButtonText}>Settle Up</Text>
+                  <Text style={styles.settleButtonText}>Record Settlement</Text>
                 </>
               )}
             </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.reminderButton}
-              onPress={handleSendReminder}
-              activeOpacity={0.7}>
-              <BellRing size={18} color={theme.colors.cream} />
-              <Text style={styles.reminderButtonText}>Send Reminder</Text>
-            </TouchableOpacity>
+            {netBalance !== null && netBalance > 0.005 && (
+              <TouchableOpacity
+                style={styles.reminderButton}
+                onPress={handleSendReminder}
+                activeOpacity={0.7}>
+                <BellRing size={18} color={theme.colors.cream} />
+                <Text style={styles.reminderButtonText}>Send Reminder</Text>
+              </TouchableOpacity>
+            )}
           </View>
         )}
 
@@ -325,35 +429,117 @@ export default function FriendDetailScreen() {
         <ZigzagEdge />
       </View>
 
-      {/* Bills List */}
-      {bills.length > 0 ? (
-        <FlatList
-          data={bills}
-          keyExtractor={(item) => item.id}
-          renderItem={({ item }) => <BillRow bill={item} friendName={friendName} />}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          ItemSeparatorComponent={() => <View style={styles.billSeparator} />}
-          ListHeaderComponent={
-            <Text style={styles.sectionTitle}>
-              {netBalance !== null && Math.abs(netBalance) > 0.005
-                ? netBalance > 0
-                  ? `Why ${friendName} owes you`
-                  : `Why you owe ${friendName}`
-                : 'Shared expenses'}
-            </Text>
-          }
-        />
-      ) : (
-        <View style={styles.emptyContainer}>
-          <View style={styles.emptyIconContainer}>
-            <Receipt size={40} color={theme.colors.textSecondary} />
-          </View>
-          <Text style={styles.emptyText}>No shared expenses yet</Text>
-        </View>
-      )}
+      {/* Main Body */}
+      <FlatList
+        data={bills}
+        keyExtractor={(item) => item.id || Math.random().toString()}
+        renderItem={({ item }) => <BillRow bill={item} friendName={friendName} />}
+        contentContainerStyle={styles.listContent}
+        showsVerticalScrollIndicator={false}
+        ItemSeparatorComponent={() => <View style={styles.billSeparator} />}
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefreshing}
+            onRefresh={onRefresh}
+            colors={[theme.colors.primary]}
+            tintColor={theme.colors.primary}
+          />
+        }
+        ListHeaderComponent={
+          <View>
+            {/* CURRENT BALANCE Card */}
+            <View style={styles.currentBalanceCard}>
+              <Text style={styles.currentBalanceHeader}>CURRENT BALANCE</Text>
+              <Text style={styles.currentBalanceValue}>
+                {isSettled
+                  ? `You and ${friendName} are settled up`
+                  : netBalance !== null && netBalance > 0.005
+                  ? `${friendName} owes you ₹${netBalance.toFixed(2)}`
+                  : `You owe ${friendName} ₹${Math.abs(netBalance || 0).toFixed(2)}`}
+              </Text>
+              <Text style={styles.currentBalanceSubtitle}>
+                {isSettled
+                  ? `No outstanding balances between you and ${friendName}.`
+                  : 'Based on shared expenses in your groups.'}
+              </Text>
+            </View>
 
-      {/* Settle Up Modal */}
+            {/* SETTLEMENT HISTORY (when present) */}
+            {paidSettlements.length > 0 && (
+              <View style={styles.settlementsSection}>
+                <View style={styles.settlementsCard}>
+                  <TouchableOpacity
+                    style={styles.settlementsHeader}
+                    onPress={() => setIsSettlementHistoryExpanded((prev) => !prev)}
+                    activeOpacity={0.7}>
+                    <View style={styles.settlementsHeaderLeft}>
+                      <Text style={styles.settlementsTitle}>SETTLEMENT HISTORY</Text>
+                      <Text style={styles.settlementsCount}>
+                        {paidSettlements.length} {paidSettlements.length === 1 ? 'record' : 'records'}
+                      </Text>
+                    </View>
+                    <ChevronDown
+                      size={18}
+                      color={theme.colors.textSecondary}
+                      style={[styles.chevron, isSettlementHistoryExpanded && styles.chevronExpanded]}
+                    />
+                  </TouchableOpacity>
+
+                  {isSettlementHistoryExpanded && (
+                    <View style={styles.settlementsBody}>
+                      {paidSettlements.map((ps: any, pIndex: number) => {
+                        const fromName = ps.fromUserId === user?.id ? 'You' : friendName;
+                        const toName = ps.toUserId === user?.id ? 'You' : friendName;
+                        const groupLabel = ps.groupId && groupNames[ps.groupId] ? groupNames[ps.groupId] : null;
+
+                        return (
+                          <View key={ps.id || pIndex}>
+                            <View style={styles.settlementRow}>
+                              <View style={{ flex: 1 }}>
+                                <Text style={styles.settlementText}>
+                                  <Text style={styles.settlementPersonName}>{fromName}</Text> paid <Text style={styles.settlementPersonName}>{toName}</Text>
+                                </Text>
+                                <Text style={styles.settlementSubtext}>
+                                  {ps.paidAt ? formatDateTime(ps.paidAt) : 'Settled'} · {groupLabel ? `${groupLabel} · ` : ''}Settlement
+                                </Text>
+                              </View>
+                              <View style={styles.settledBadge}>
+                                <CheckCircle2 size={13} color={theme.colors.success} style={{ marginRight: 4 }} />
+                                <Text style={styles.settledBadgeText}>{formatMoney(ps.amount || 0, ps.currency || 'INR', true)}</Text>
+                              </View>
+                            </View>
+                            {pIndex < paidSettlements.length - 1 && <View style={styles.settlementRowDivider} />}
+                          </View>
+                        );
+                      })}
+                    </View>
+                  )}
+                </View>
+              </View>
+            )}
+
+            {/* WHY? Section Header */}
+            <View style={styles.whyHeader}>
+              <Text style={styles.whyTitle}>WHY? (SHARED EXPENSES)</Text>
+              {bills.length > 0 && (
+                <Text style={styles.whyBadge}>
+                  {bills.length} {bills.length === 1 ? 'expense' : 'expenses'}
+                </Text>
+              )}
+            </View>
+          </View>
+        }
+        ListEmptyComponent={
+          <View style={styles.emptyContainer}>
+            <View style={styles.emptyIconContainer}>
+              <Receipt size={40} color={theme.colors.textSecondary} />
+            </View>
+            <Text style={styles.emptyText}>No shared expenses yet</Text>
+          </View>
+        }
+      />
+
+      {/* Record Settlement Modal (Part 6) */}
       {netBalance !== null && (
         <Modal
           visible={settleModalVisible}
@@ -362,18 +548,51 @@ export default function FriendDetailScreen() {
           onRequestClose={() => setSettleModalVisible(false)}>
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>Record settlement</Text>
+              <Text style={styles.modalTitle}>RECORD SETTLEMENT</Text>
               
               <View style={styles.modalBody}>
                 <Text style={styles.modalDirectionText}>
                   {netBalance < 0 ? `You pay ${friendName}` : `${friendName} pays you`}
                 </Text>
-                <Text style={styles.modalAmountText}>₹{Math.abs(netBalance).toFixed(2)}</Text>
+                <Text
+                  style={[
+                    styles.modalAmountText,
+                    { color: netBalance > 0 ? theme.colors.success : theme.colors.danger },
+                  ]}>
+                  ₹{Math.abs(netBalance).toFixed(2)}
+                </Text>
+                <Text style={styles.modalCurrentBalance}>
+                  Current balance: {netBalance > 0 ? `${friendName} owes you` : `You owe ${friendName}`} ₹{Math.abs(netBalance).toFixed(2)}
+                </Text>
               </View>
 
-              <Text style={styles.modalSubtitle}>
-                This payment will clear the current ₹{Math.abs(netBalance).toFixed(2)} balance created by your shared expenses.
-              </Text>
+              {contributingBills.length > 0 ? (
+                <View style={styles.contributingContainer}>
+                  <Text style={styles.modalReduceLabel}>This will reduce:</Text>
+                  {contributingBills.slice(0, 3).map((b) => {
+                    const bCurr = b.currency || 'INR';
+                    const isBForeign = bCurr.toUpperCase() !== 'INR';
+                    const bInr = b.convertedShareAmount ?? (isBForeign ? Math.round(b.shareAmount * (b.exchangeRate || 1) * 100) / 100 : b.shareAmount);
+                    return (
+                      <View key={b.id} style={styles.modalBillRow}>
+                        <Text style={styles.modalBillTitle} numberOfLines={1}>{b.title}</Text>
+                        <Text style={styles.modalBillAmount}>
+                          ₹{bInr.toFixed(2)}{isBForeign ? ` (${formatMoney(b.shareAmount, bCurr)})` : ''}
+                        </Text>
+                      </View>
+                    );
+                  })}
+                  {contributingBills.length > 3 && (
+                    <Text style={styles.modalMoreBills}>
+                      +{contributingBills.length - 3} more shared expenses
+                    </Text>
+                  )}
+                </View>
+              ) : (
+                <Text style={styles.modalSubtitle}>
+                  This payment will clear the current ₹{Math.abs(netBalance).toFixed(2)} balance created by shared expenses.
+                </Text>
+              )}
 
               <View style={styles.modalActions}>
                 <TouchableOpacity
@@ -382,10 +601,13 @@ export default function FriendDetailScreen() {
                   <Text style={styles.modalCancelText}>CANCEL</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={styles.modalConfirmButton}
+                  style={[
+                    styles.modalConfirmButton,
+                    { backgroundColor: netBalance > 0 ? theme.colors.success : theme.colors.primary },
+                  ]}
                   onPress={handleConfirmSettle}>
                   {isSettling ? (
-                    <ActivityIndicator size="small" color={theme.colors.heroBg} />
+                    <ActivityIndicator size="small" color={theme.colors.cream} />
                   ) : (
                     <Text style={styles.modalConfirmText}>
                       CONFIRM ₹{Math.abs(netBalance).toFixed(2)} {netBalance < 0 ? 'PAID' : 'RECEIVED'}
@@ -503,14 +725,204 @@ const styles = StyleSheet.create({
   },
   listContent: {
     paddingHorizontal: theme.spacing[24],
-    paddingTop: theme.spacing[24],
+    paddingTop: theme.spacing[16],
     paddingBottom: theme.spacing[24],
   },
-  sectionTitle: {
-    fontSize: 14,
-    fontWeight: '500',
+  currentBalanceCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: 16,
+    marginBottom: 20,
+  },
+  currentBalanceHeader: {
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    color: theme.colors.textSecondary,
+    marginBottom: 6,
+    fontFamily: theme.fontFamily.regular,
+  },
+  currentBalanceValue: {
+    fontSize: 16,
+    fontWeight: '600',
     color: theme.colors.textPrimary,
+    marginBottom: 4,
+    fontFamily: theme.fontFamily.regular,
+  },
+  currentBalanceSubtitle: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  settlementsSection: {
+    marginBottom: 20,
+  },
+  settlementsCard: {
+    backgroundColor: theme.colors.surface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 14,
+    padding: theme.spacing[16],
+  },
+  settlementsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  settlementsHeaderLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.spacing[8],
+  },
+  settlementsTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  settlementsCount: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+    backgroundColor: theme.colors.background,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    overflow: 'hidden',
+  },
+  chevron: {
+    transform: [{ rotate: '0deg' }],
+  },
+  chevronExpanded: {
+    transform: [{ rotate: '180deg' }],
+  },
+  settlementsBody: {
+    marginTop: theme.spacing[12],
+    paddingTop: theme.spacing[12],
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.border,
+  },
+  settlementRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: theme.spacing[8],
+    gap: theme.spacing[8],
+  },
+  settlementRowDivider: {
+    height: 1,
+    backgroundColor: theme.colors.border,
+    marginVertical: 4,
+  },
+  settlementText: {
+    fontSize: 14,
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  settlementPersonName: {
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+  },
+  settlementSubtext: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+    fontFamily: theme.fontFamily.regular,
+  },
+  settledBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexShrink: 0,
+    backgroundColor: 'rgba(34, 197, 94, 0.12)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(34, 197, 94, 0.25)',
+  },
+  settledBadgeText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.success,
+    fontFamily: theme.fontFamily.mono,
+  },
+  whyHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     marginBottom: theme.spacing[12],
+  },
+  whyTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.regular,
+  },
+  whyBadge: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    backgroundColor: theme.colors.surface,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    overflow: 'hidden',
+    fontFamily: theme.fontFamily.regular,
+  },
+  contributingContainer: {
+    width: '100%',
+    backgroundColor: theme.colors.background,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: 12,
+    marginBottom: theme.spacing[24],
+  },
+  modalReduceLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: theme.colors.textSecondary,
+    marginBottom: 6,
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalBillRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  modalBillTitle: {
+    fontSize: 13,
+    color: theme.colors.textPrimary,
+    flex: 1,
+    marginRight: 8,
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalBillAmount: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  modalMoreBills: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    fontStyle: 'italic',
+    marginTop: 4,
+    fontFamily: theme.fontFamily.regular,
+  },
+  modalCurrentBalance: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    textAlign: 'center',
+    marginTop: 4,
     fontFamily: theme.fontFamily.regular,
   },
   billItem: {
@@ -560,6 +972,15 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: theme.colors.textPrimary,
     fontFamily: theme.fontFamily.mono,
+  },
+  billAmountContainer: {
+    alignItems: 'flex-end',
+  },
+  billConvertedAmount: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
+    fontFamily: theme.fontFamily.mono,
+    marginTop: 2,
   },
   loadingContainer: {
     flex: 1,

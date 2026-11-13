@@ -1,18 +1,34 @@
-import { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
-import { Camera, Image as ImageIcon, ChevronLeft } from 'lucide-react-native';
+import React, { useState, useEffect } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Alert,
+  ActivityIndicator,
+  Image,
+} from 'react-native';
+import { Camera, Image as ImageIcon, ChevronLeft, Crop, Check } from 'lucide-react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { theme } from '@/constants/theme';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useBillCreation } from '../context/BillCreationContext';
 import apiClient from '../services/apiClient';
+import { ReceiptCropperModal } from '@/components/ReceiptCropperModal';
 
 export default function ScanBillScreen() {
   const router = useRouter();
   const params = useLocalSearchParams();
   const { setGroupId, setScannedItems, setReceiptUrl, groupId } = useBillCreation();
+
+  // Selected (confirmed cropped) image
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
+  // Raw uncropped source image from camera or gallery
+  const [rawImage, setRawImage] = useState<string | null>(null);
+  // Cropper visibility
+  const [isCropperVisible, setIsCropperVisible] = useState<boolean>(false);
+  // OCR scanning state
+  const [isScanning, setIsScanning] = useState<boolean>(false);
 
   // Set groupId from params if provided
   useEffect(() => {
@@ -34,15 +50,16 @@ export default function ScanBillScreen() {
     const hasPermission = await requestPermission();
     if (!hasPermission) return;
 
+    // Use full image capture without native uCrop fixed-ratio constraints
     const result = await ImagePicker.launchCameraAsync({
       mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.8,
+      allowsEditing: false,
+      quality: 1.0,
     });
 
     if (!result.canceled && result.assets[0]) {
-      setSelectedImage(result.assets[0].uri);
+      setRawImage(result.assets[0].uri);
+      setIsCropperVisible(true);
     }
   };
 
@@ -50,20 +67,24 @@ export default function ScanBillScreen() {
     const hasPermission = await requestPermission();
     if (!hasPermission) return;
 
+    // Use full image selection without native uCrop fixed-ratio constraints
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.8,
+      allowsEditing: false,
+      quality: 1.0,
     });
 
     if (!result.canceled && result.assets[0]) {
-      setSelectedImage(result.assets[0].uri);
+      setRawImage(result.assets[0].uri);
+      setIsCropperVisible(true);
     }
   };
 
-  const handleContinue = async () => {
-    if (!selectedImage) return;
+  /**
+   * Submits the cropped image to the backend OCR scan endpoint
+   */
+  const scanReceipt = async (imageUriToScan: string) => {
+    if (!imageUriToScan) return;
 
     setIsScanning(true);
 
@@ -71,33 +92,20 @@ export default function ScanBillScreen() {
       // Create FormData for multipart upload
       const formData = new FormData();
       formData.append('image', {
-        uri: selectedImage,
+        uri: imageUriToScan,
         type: 'image/jpeg',
         name: 'bill.jpg',
       } as any);
 
       // Upload to OCR endpoint
-      // NOTE: Do NOT manually set Content-Type header - axios auto-detects
-      // FormData and sets the correct multipart/form-data with boundary.
-      // Manually setting it strips the boundary and breaks backend parsing.
       const response = await apiClient.post('/ocr/scan', formData, {
         timeout: 120000,
       });
 
-      // The backend now returns a structured parse result with a suggested
-      // title, detected total, confidence, and parsed items. Prefer these
-      // backend-computed values over any client-side re-parsing of rawText.
-      const rawText = response.data.rawText || '';
       const confidence = response.data.confidence || 'LOW';
       const ocrItems = response.data.items || [];
+      const extractedTitle = (response.data.suggestedTitle as string) || '';
 
-      // Suggested title & total come from the backend's structured parse
-      // (a more robust "total" line detector and merchant-name suggester).
-      const extractedTitle =
-        (response.data.suggestedTitle as string) || '';
-
-      // Use backend detected total if available; otherwise fall back to
-      // summing parsed items so we never pass 0/NaN to the entry screen.
       let finalTotal: number;
       const backendTotal = response.data.totalAmount
         ? parseFloat(response.data.totalAmount)
@@ -111,7 +119,7 @@ export default function ScanBillScreen() {
         );
       }
 
-      // Transform OCR response to BillItem format, preserving qty/unitPrice
+      // Transform OCR response to BillItem format
       const billItems = ocrItems.map((item: any, index: number) => ({
         id: `item-${index}`,
         name: item.name || item.description || 'Unknown Item',
@@ -139,42 +147,45 @@ export default function ScanBillScreen() {
         receiptUrl,
       });
 
-      // Navigate to manual-entry with extracted data and financial breakdown
-      const navParams: any = {
-        scannedTitle: extractedTitle,
-        scannedAmount: String(finalTotal),
-        ocrConfidence: confidence,
-      };
-      if (receiptUrl) {
-        navParams.receiptUrl = receiptUrl;
-      }
-      if (groupId) {
-        navParams.groupId = groupId;
-      }
-      // Pass financial breakdown as JSON for the review screen
-      const financials: any = {};
-      if (response.data.subtotal) financials.subtotal = response.data.subtotal;
-      if (response.data.cgst) financials.cgst = response.data.cgst;
-      if (response.data.sgst) financials.sgst = response.data.sgst;
-      if (response.data.tax) financials.tax = response.data.tax;
-      if (response.data.serviceCharge) financials.serviceCharge = response.data.serviceCharge;
-      if (response.data.discount) financials.discount = response.data.discount;
-      if (response.data.roundOff) financials.roundOff = response.data.roundOff;
-      if (Object.keys(financials).length > 0) {
-        navParams.ocrFinancials = JSON.stringify(financials);
-      }
+      // Close cropper modal if open
+      setIsCropperVisible(false);
 
-      router.push({ pathname: '/manual-entry', params: navParams });
+      // Navigate to OCR review/edit screen
+      router.push({
+        pathname: '/ocr-review',
+        params: {
+          rawScanData: JSON.stringify(response.data),
+          scannedTitle: extractedTitle,
+          scannedAmount: String(finalTotal),
+          currency: response.data.currency || 'INR',
+          receiptUrl: receiptUrl || '',
+          localImageUri: imageUriToScan,
+          groupId: groupId || '',
+        },
+      });
     } catch (error: any) {
       console.error('OCR scan error:', error);
-      console.log('OCR error message:', error.message);
-      console.log('OCR error code:', error.code);
-      console.log('OCR error response status:', error.response?.status);
-      console.log('OCR error response data:', error.response?.data);
       Alert.alert('Error', 'Failed to scan bill. Please try again.');
     } finally {
       setIsScanning(false);
     }
+  };
+
+  /**
+   * Called when user confirms crop by pressing "Done"
+   */
+  const handleCropDone = async (croppedUri: string) => {
+    setSelectedImage(croppedUri);
+    // Proceed to existing receipt-scanning flow
+    await scanReceipt(croppedUri);
+  };
+
+  /**
+   * Called when user cancels cropping
+   */
+  const handleCropCancel = () => {
+    setIsCropperVisible(false);
+    // Discard unconfirmed crop, leaving previous state intact
   };
 
   return (
@@ -196,7 +207,13 @@ export default function ScanBillScreen() {
           onPress={selectedImage ? undefined : chooseFromGallery}
           activeOpacity={0.7}>
           {selectedImage ? (
-            <Text style={styles.previewText}>Image selected ✓</Text>
+            <View style={styles.previewContainer}>
+              <Image source={{ uri: selectedImage }} style={styles.previewImage} resizeMode="contain" />
+              <View style={styles.previewBadge}>
+                <Check size={14} color="#FFFFFF" />
+                <Text style={styles.previewBadgeText}>Receipt Cropped ✓</Text>
+              </View>
+            </View>
           ) : (
             <>
               <View style={styles.cameraCircle}>
@@ -220,18 +237,48 @@ export default function ScanBillScreen() {
             </TouchableOpacity>
           </View>
         ) : (
-          <TouchableOpacity
-            style={styles.continueButton}
-            onPress={handleContinue}
-            disabled={isScanning}>
-            {isScanning ? (
-              <ActivityIndicator color={theme.colors.cream} />
-            ) : (
-              <Text style={styles.continueButtonText}>Continue</Text>
-            )}
-          </TouchableOpacity>
+          <View style={styles.selectedActionsContainer}>
+            <View style={styles.buttonRow}>
+              {rawImage && (
+                <TouchableOpacity
+                  style={styles.outlineButton}
+                  onPress={() => setIsCropperVisible(true)}
+                  disabled={isScanning}>
+                  <Crop size={18} color={theme.colors.primary} />
+                  <Text style={styles.outlineButtonText}>Adjust Crop</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={styles.outlineButton}
+                onPress={chooseFromGallery}
+                disabled={isScanning}>
+                <ImageIcon size={18} color={theme.colors.primary} />
+                <Text style={styles.outlineButtonText}>Change Photo</Text>
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity
+              style={styles.continueButton}
+              onPress={() => scanReceipt(selectedImage)}
+              disabled={isScanning}>
+              {isScanning ? (
+                <ActivityIndicator color={theme.colors.cream} />
+              ) : (
+                <Text style={styles.continueButtonText}>Scan Bill</Text>
+              )}
+            </TouchableOpacity>
+          </View>
         )}
       </View>
+
+      {/* Responsive Receipt Cropper Modal */}
+      <ReceiptCropperModal
+        visible={isCropperVisible}
+        imageUri={rawImage}
+        onDone={handleCropDone}
+        onCancel={handleCropCancel}
+        isProcessing={isScanning}
+      />
     </View>
   );
 }
@@ -277,7 +324,41 @@ const styles = StyleSheet.create({
     aspectRatio: 0.85,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: theme.spacing[16],
+    overflow: 'hidden',
+  },
+  previewContainer: {
+    width: '100%',
+    height: '100%',
+    position: 'relative',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FAF8F5',
+  },
+  previewImage: {
+    width: '90%',
+    height: '90%',
+  },
+  previewBadge: {
+    position: 'absolute',
+    bottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: theme.colors.success,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  previewBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '600',
+    fontFamily: theme.fontFamily.regular,
   },
   cameraCircle: {
     width: 72,
@@ -286,6 +367,7 @@ const styles = StyleSheet.create({
     backgroundColor: theme.colors.accentBg,
     justifyContent: 'center',
     alignItems: 'center',
+    marginBottom: theme.spacing[16],
   },
   uploadText: {
     fontSize: 14,
@@ -294,11 +376,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: theme.spacing[24],
     fontFamily: theme.fontFamily.regular,
   },
-  previewText: {
-    fontSize: 16,
-    color: theme.colors.success,
-    fontWeight: '500',
-    fontFamily: theme.fontFamily.regular,
+  selectedActionsContainer: {
+    gap: theme.spacing[12],
+    marginTop: 20,
   },
   buttonRow: {
     flexDirection: 'row',
@@ -353,7 +433,6 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: theme.spacing[24],
     shadowColor: theme.colors.primary,
     shadowOffset: {
       width: 0,

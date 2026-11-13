@@ -5,9 +5,11 @@ import com.splitwise.splitwisebackend.dto.ParticipantShare;
 import com.splitwise.splitwisebackend.dto.Settlement;
 import com.splitwise.splitwisebackend.model.Bill;
 import com.splitwise.splitwisebackend.model.BillItem;
+import com.splitwise.splitwisebackend.model.Group;
 import com.splitwise.splitwisebackend.model.SettlementRecord;
 import com.splitwise.splitwisebackend.model.User;
 import com.splitwise.splitwisebackend.repository.BillRepository;
+import com.splitwise.splitwisebackend.repository.GroupRepository;
 import com.splitwise.splitwisebackend.repository.SettlementRecordRepository;
 import com.splitwise.splitwisebackend.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -15,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.*;
 
 @Service
@@ -24,20 +27,32 @@ public class SplitCalculationService {
     private final BillRepository billRepository;
     private final SettlementRecordRepository settlementRecordRepository;
     private final UserRepository userRepository;
+    private final GroupRepository groupRepository;
+    private final CurrencyConversionService currencyConversionService;
 
     @Autowired
     public SplitCalculationService(BillRepository billRepository,
                                    SettlementRecordRepository settlementRecordRepository,
-                                   UserRepository userRepository) {
+                                   UserRepository userRepository,
+                                   GroupRepository groupRepository,
+                                   CurrencyConversionService currencyConversionService) {
         this.billRepository = billRepository;
         this.settlementRecordRepository = settlementRecordRepository;
         this.userRepository = userRepository;
+        this.groupRepository = groupRepository;
+        this.currencyConversionService = currencyConversionService != null ? currencyConversionService : new CurrencyConversionService();
     }
 
-    /** Constructor for tests where UserRepository is not mocked. */
+    /** Constructor for tests where optional repositories are not mocked. */
     public SplitCalculationService(BillRepository billRepository,
                                    SettlementRecordRepository settlementRecordRepository) {
-        this(billRepository, settlementRecordRepository, null);
+        this(billRepository, settlementRecordRepository, null, null, new CurrencyConversionService());
+    }
+
+    public SplitCalculationService(BillRepository billRepository,
+                                   SettlementRecordRepository settlementRecordRepository,
+                                   UserRepository userRepository) {
+        this(billRepository, settlementRecordRepository, userRepository, null, new CurrencyConversionService());
     }
 
     /**
@@ -78,10 +93,10 @@ public class SplitCalculationService {
             return shares;
         }
 
-        String payerId = bill.getPaidBy();
+        String payerId = bill.getPaidBy() != null ? bill.getPaidBy().trim() : null;
 
         for (BillItem item : bill.getItems()) {
-            if (item == null || item.getPrice() == null) {
+            if (item == null || item.getPrice() == null || item.getPrice() <= 0) {
                 continue;
             }
 
@@ -90,9 +105,9 @@ public class SplitCalculationService {
                 for (Map.Entry<String, Double> entry : item.getCustomShares().entrySet()) {
                     String userId = entry.getKey();
                     Double customAmount = entry.getValue();
-                    if (userId != null && customAmount != null) {
+                    if (userId != null && !userId.trim().isEmpty() && customAmount != null && customAmount > 0) {
                         double roundedAmount = Math.round(customAmount * 100.0) / 100.0;
-                        shares.put(userId, roundToTwoDecimals(shares.getOrDefault(userId, 0.0) + roundedAmount));
+                        shares.put(userId.trim(), roundToTwoDecimals(shares.getOrDefault(userId.trim(), 0.0) + roundedAmount));
                     }
                 }
                 continue;
@@ -105,7 +120,12 @@ public class SplitCalculationService {
             }
 
             // De-duplicate participants while maintaining deterministic order
-            Set<String> uniqueSet = new LinkedHashSet<>(sharedBy);
+            Set<String> uniqueSet = new LinkedHashSet<>();
+            for (String s : sharedBy) {
+                if (s != null && !s.trim().isEmpty()) {
+                    uniqueSet.add(s.trim());
+                }
+            }
             if (uniqueSet.isEmpty()) {
                 continue;
             }
@@ -116,12 +136,15 @@ public class SplitCalculationService {
                 orderedParticipants.add(payerId);
             }
             for (String uid : uniqueSet) {
-                if (!uid.equals(payerId)) {
+                if (payerId == null || !uid.equals(payerId)) {
                     orderedParticipants.add(uid);
                 }
             }
 
             int participantCount = orderedParticipants.size();
+            if (participantCount == 0) {
+                continue;
+            }
             long totalCents = Math.round(item.getPrice() * 100.0);
             long baseCents = totalCents / participantCount;
             long remainderCents = totalCents % participantCount;
@@ -138,6 +161,98 @@ public class SplitCalculationService {
     }
 
     /**
+     * Calculates individual shares denominated in the universal settlement currency (INR).
+     *
+     * Converts the bill into INR using the locked exchangeRate, and performs deterministic
+     * integer paise (cents) division among unique participants.
+     * Guaranteed: sum(all inrShares) == convertedInrAmount down to the exact paisa.
+     */
+    public Map<String, Double> calculateIndividualInrShares(Bill bill) {
+        Map<String, Double> inrShares = new LinkedHashMap<>();
+        if (bill == null || bill.getItems() == null || bill.getItems().isEmpty()) {
+            return inrShares;
+        }
+
+        String curr = bill.getCurrency() != null && !bill.getCurrency().trim().isEmpty()
+                ? bill.getCurrency().trim().toUpperCase()
+                : "INR";
+        double rate = bill.getExchangeRate() != null && bill.getExchangeRate() > 0
+                ? bill.getExchangeRate()
+                : ("INR".equalsIgnoreCase(curr) ? 1.0 : currencyConversionService.getExchangeRate(curr, "INR"));
+
+        if ("INR".equalsIgnoreCase(curr)) {
+            return calculateIndividualShares(bill);
+        }
+
+        String payerId = bill.getPaidBy() != null ? bill.getPaidBy().trim() : null;
+
+        for (BillItem item : bill.getItems()) {
+            if (item == null || item.getPrice() == null || item.getPrice() <= 0) {
+                continue;
+            }
+
+            double itemInrPrice = roundToTwoDecimals(item.getPrice() * rate);
+
+            // Case 1: Custom / Unequal split per item
+            if (item.getCustomShares() != null && !item.getCustomShares().isEmpty()) {
+                for (Map.Entry<String, Double> entry : item.getCustomShares().entrySet()) {
+                    String userId = entry.getKey();
+                    Double customAmount = entry.getValue();
+                    if (userId != null && !userId.trim().isEmpty() && customAmount != null && customAmount > 0) {
+                        double customInr = roundToTwoDecimals(customAmount * rate);
+                        inrShares.put(userId.trim(), roundToTwoDecimals(inrShares.getOrDefault(userId.trim(), 0.0) + customInr));
+                    }
+                }
+                continue;
+            }
+
+            // Case 2: Equal split among unique participants
+            List<String> sharedBy = item.getSharedByUserIds();
+            if (sharedBy == null || sharedBy.isEmpty()) {
+                continue;
+            }
+
+            Set<String> uniqueSet = new LinkedHashSet<>();
+            for (String s : sharedBy) {
+                if (s != null && !s.trim().isEmpty()) {
+                    uniqueSet.add(s.trim());
+                }
+            }
+            if (uniqueSet.isEmpty()) {
+                continue;
+            }
+
+            List<String> orderedParticipants = new ArrayList<>();
+            if (payerId != null && uniqueSet.contains(payerId)) {
+                orderedParticipants.add(payerId);
+            }
+            for (String uid : uniqueSet) {
+                if (payerId == null || !uid.equals(payerId)) {
+                    orderedParticipants.add(uid);
+                }
+            }
+
+            int participantCount = orderedParticipants.size();
+            if (participantCount == 0) {
+                continue;
+            }
+
+            long totalCents = Math.round(itemInrPrice * 100.0);
+            long baseCents = totalCents / participantCount;
+            long remainderCents = totalCents % participantCount;
+
+            for (int i = 0; i < participantCount; i++) {
+                String userId = orderedParticipants.get(i);
+                long cents = baseCents + (i < remainderCents ? 1 : 0);
+                double userShare = cents / 100.0;
+                inrShares.put(userId, roundToTwoDecimals(inrShares.getOrDefault(userId, 0.0) + userShare));
+            }
+        }
+
+        return inrShares;
+    }
+
+    /**
      * Produces a comprehensive breakdown for an expense showing:
      * - Total bill amount
      * - Who paid (and how much they paid)
@@ -150,8 +265,22 @@ public class SplitCalculationService {
         }
 
         Map<String, Double> shares = calculateIndividualShares(bill);
+        Map<String, Double> inrShares = calculateIndividualInrShares(bill);
         String payerId = bill.getPaidBy();
         double totalAmount = bill.getTotalAmount() != null ? roundToTwoDecimals(bill.getTotalAmount()) : 0.0;
+
+        String currency = bill.getCurrency() != null && !bill.getCurrency().trim().isEmpty()
+                ? bill.getCurrency().trim().toUpperCase()
+                : "INR";
+        String baseCurrency = bill.getBaseCurrency() != null && !bill.getBaseCurrency().trim().isEmpty()
+                ? bill.getBaseCurrency().trim().toUpperCase()
+                : "INR";
+        Double exchangeRate = bill.getExchangeRate() != null && bill.getExchangeRate() > 0
+                ? bill.getExchangeRate()
+                : ("INR".equalsIgnoreCase(currency) ? 1.0 : currencyConversionService.getExchangeRate(currency, "INR"));
+        Double convertedAmount = bill.getConvertedAmount() != null && bill.getConvertedAmount() > 0
+                ? bill.getConvertedAmount()
+                : roundToTwoDecimals(totalAmount * exchangeRate);
 
         // Collect all distinct participants (everyone who owes a share + payer)
         Set<String> allParticipantIds = new LinkedHashSet<>();
@@ -159,6 +288,7 @@ public class SplitCalculationService {
             allParticipantIds.add(payerId);
         }
         allParticipantIds.addAll(shares.keySet());
+        allParticipantIds.addAll(inrShares.keySet());
 
         String paidByName = "Unknown";
         if (payerId != null && userRepository != null) {
@@ -180,12 +310,19 @@ public class SplitCalculationService {
             double share = shares.getOrDefault(userId, 0.0);
             double net = roundToTwoDecimals(paid - share);
 
+            double convPaid = userId.equals(payerId) ? convertedAmount : 0.0;
+            double convShare = inrShares.getOrDefault(userId, 0.0);
+            double convNet = roundToTwoDecimals(convPaid - convShare);
+
             participantShares.add(ParticipantShare.builder()
                     .userId(userId)
                     .name(name)
                     .paidAmount(paid)
                     .shareAmount(share)
                     .netAmount(net)
+                    .convertedPaidAmount(convPaid)
+                    .convertedShareAmount(convShare)
+                    .convertedNetAmount(convNet)
                     .build());
         }
 
@@ -193,6 +330,11 @@ public class SplitCalculationService {
                 .billId(bill.getId())
                 .title(bill.getTitle())
                 .totalAmount(totalAmount)
+                .currency(currency)
+                .baseCurrency(baseCurrency)
+                .exchangeRate(exchangeRate)
+                .exchangeRateDate(bill.getExchangeRateDate() != null ? bill.getExchangeRateDate().toString() : null)
+                .convertedAmount(convertedAmount)
                 .paidBy(payerId)
                 .paidByName(paidByName)
                 .participantCount(allParticipantIds.size())
@@ -299,6 +441,7 @@ public class SplitCalculationService {
             if (creditor.cents <= 0) continue;
             for (BalanceEntry debtor : debtors) {
                 if (debtor.cents <= 0) continue;
+                if (creditor.userId.equals(debtor.userId)) continue;
                 if (creditor.cents == debtor.cents) {
                     double amount = creditor.cents / 100.0;
                     settlements.add(buildSettlement(debtor.userId, creditor.userId, amount));
@@ -329,6 +472,15 @@ public class SplitCalculationService {
             BalanceEntry creditor = remainingCreditors.get(creditorPtr);
             BalanceEntry debtor = remainingDebtors.get(debtorPtr);
 
+            if (creditor.userId.equals(debtor.userId)) {
+                if (creditorPtr < remainingCreditors.size() - 1) {
+                    creditorPtr++;
+                } else {
+                    debtorPtr++;
+                }
+                continue;
+            }
+
             long settleCents = Math.min(creditor.cents, debtor.cents);
             if (settleCents > 0) {
                 double amount = settleCents / 100.0;
@@ -348,24 +500,33 @@ public class SplitCalculationService {
 
         // Sort settlements deterministically: fromUserId ascending, then toUserId ascending
         settlements.sort(Comparator
-                .comparing((Settlement s) -> s.getFromUserId())
-                .thenComparing(Settlement::getToUserId));
+                .comparing((Settlement s) -> s.getFromUserId() != null ? s.getFromUserId() : "")
+                .thenComparing((Settlement s) -> s.getToUserId() != null ? s.getToUserId() : ""));
 
         return settlements;
     }
 
     private Settlement buildSettlement(String fromUserId, String toUserId, double amount) {
         Settlement settlement = new Settlement(fromUserId, toUserId, roundToTwoDecimals(amount));
+        settlement.setCurrency("INR");
         if (userRepository != null) {
-            settlement.setFromUserName(userRepository.findById(fromUserId)
-                    .map(User::getFullName)
-                    .orElse(fromUserId));
-            settlement.setToUserName(userRepository.findById(toUserId)
-                    .map(User::getFullName)
-                    .orElse(toUserId));
+            if (fromUserId != null && !fromUserId.trim().isEmpty()) {
+                settlement.setFromUserName(userRepository.findById(fromUserId.trim())
+                        .map(User::getFullName)
+                        .orElse(fromUserId));
+            } else {
+                settlement.setFromUserName("Unknown");
+            }
+            if (toUserId != null && !toUserId.trim().isEmpty()) {
+                settlement.setToUserName(userRepository.findById(toUserId.trim())
+                        .map(User::getFullName)
+                        .orElse(toUserId));
+            } else {
+                settlement.setToUserName("Unknown");
+            }
         } else {
-            settlement.setFromUserName(fromUserId);
-            settlement.setToUserName(toUserId);
+            settlement.setFromUserName(fromUserId != null ? fromUserId : "Unknown");
+            settlement.setToUserName(toUserId != null ? toUserId : "Unknown");
         }
         return settlement;
     }
@@ -378,10 +539,16 @@ public class SplitCalculationService {
      *
      * Invariant: Total money is conserved — sum(all net balances) == 0.00.
      *
+     * Multi-Currency Handling:
+     * Balances are aggregated in the group's default currency (or INR if unassigned).
+     * For any bill denominated in a different currency, individual shares are converted
+     * into the target currency using the bill's locked exchange rate. The payer is credited
+     * with the exact sum of these converted shares, guaranteeing that sum(netBalances) == 0.00.
+     *
      * Personal expenses (bills with no groupId, OR bills where all items have
      * at most one UNIQUE participant) are COMPLETELY excluded from any
      * debt/settlement math — they are personal records and must contribute
-     * exactly ₹0 to every balance.
+     * exactly 0 to every balance.
      *
      * @param groupId the group to calculate balances for
      * @return map of userId -> net balance (positive = owed, negative = owes)
@@ -394,6 +561,8 @@ public class SplitCalculationService {
             return netBalances;
         }
 
+        final String targetCurrency = "INR";
+
         for (Bill bill : bills) {
             if (bill == null || isPersonalExpense(bill)) {
                 log.debug("[SplitCalculation] Excluded personal bill from balance math: id={}, title={}, total={}, groupId={}, paidBy={}",
@@ -405,35 +574,47 @@ public class SplitCalculationService {
                 continue;
             }
 
-            Map<String, Double> shares = calculateIndividualShares(bill);
-            if (shares.isEmpty()) {
+            Map<String, Double> inrShares = calculateIndividualInrShares(bill);
+            if (inrShares.isEmpty()) {
                 continue;
             }
 
-            // The payer is credited the exact sum of individual shares for this bill.
-            // This guarantees that total credited equals total debited down to the exact cent,
-            // strictly conserving money and preserving the zero-sum invariant.
-            String paidBy = bill.getPaidBy();
-            double credited = shares.values().stream().mapToDouble(Double::doubleValue).sum();
-            credited = roundToTwoDecimals(credited);
+            String billCurrency = bill.getCurrency() != null && !bill.getCurrency().trim().isEmpty()
+                    ? bill.getCurrency().trim().toUpperCase()
+                    : "INR";
 
-            netBalances.put(paidBy, roundToTwoDecimals(netBalances.getOrDefault(paidBy, 0.0) + credited));
-
-            // Each UNIQUE person who shared items is debited their exact share
-            for (Map.Entry<String, Double> entry : shares.entrySet()) {
+            // The payer is credited the exact sum of converted individual INR shares for this bill.
+            // This guarantees that total credited equals total debited down to the exact paisa (cent),
+            // strictly conserving money and preserving the zero-sum invariant across all currencies.
+            double totalCredited = 0.0;
+            for (Map.Entry<String, Double> entry : inrShares.entrySet()) {
                 String userId = entry.getKey();
-                double share = entry.getValue();
-                netBalances.put(userId, roundToTwoDecimals(netBalances.getOrDefault(userId, 0.0) - share));
+                if (userId == null || userId.trim().isEmpty()) {
+                    continue;
+                }
+                double inrShare = entry.getValue() != null ? entry.getValue() : 0.0;
+                totalCredited += inrShare;
+                netBalances.put(userId.trim(), roundToTwoDecimals(netBalances.getOrDefault(userId.trim(), 0.0) - inrShare));
             }
 
-            log.debug("[SplitCalculation] Included group bill in balance math: id={}, title={}, totalCredited={}, paidBy={}, perUserShares={}",
-                    bill.getId(), bill.getTitle(), credited, paidBy, shares);
+            totalCredited = roundToTwoDecimals(totalCredited);
+            String paidBy = bill.getPaidBy() != null ? bill.getPaidBy().trim() : null;
+            if (paidBy != null && !paidBy.isEmpty()) {
+                netBalances.put(paidBy, roundToTwoDecimals(netBalances.getOrDefault(paidBy, 0.0) + totalCredited));
+            }
+
+            log.debug("[SplitCalculation] Included group bill in balance math: id={}, title={}, billCurrency={}, targetCurrency={}, totalCredited={}, paidBy={}, inrShares={}",
+                    bill.getId(), bill.getTitle(), billCurrency, targetCurrency, totalCredited, paidBy, inrShares);
         }
 
         // Filter out balances that are effectively zero (|balance| < 0.005)
-        // Clean up small floating point residues
+        // Clean up small floating point residues and remove null/blank keys
         for (Map.Entry<String, Double> entry : new ArrayList<>(netBalances.entrySet())) {
-            double rounded = roundToTwoDecimals(entry.getValue());
+            if (entry.getKey() == null || entry.getKey().trim().isEmpty()) {
+                netBalances.remove(entry.getKey());
+                continue;
+            }
+            double rounded = roundToTwoDecimals(entry.getValue() != null ? entry.getValue() : 0.0);
             if (Math.abs(rounded) < 0.005) {
                 netBalances.put(entry.getKey(), 0.0);
             } else {
@@ -446,13 +627,82 @@ public class SplitCalculationService {
     }
 
     /**
+     * Calculates the remaining net balances for a group after accounting for
+     * all PAID settlements.
+     *
+     * Net Balance = Sum of bill shares (Expenses) - Sum of PAID settlements.
+     *
+     * Payer of a settlement (debtor) has their negative balance credited (+amount).
+     * Receiver of a settlement (creditor) has their positive balance debited (-amount).
+     *
+     * @param groupId the group ID
+     * @return map of userId -> remaining net balance (positive = owed, negative = owes, 0.0 = settled)
+     */
+    public Map<String, Double> calculateRemainingNetBalancesForGroup(String groupId) {
+        Map<String, Double> netBalances = calculateNetBalancesForGroup(groupId);
+
+        // If a group has no bills/expenses, remaining balances are strictly empty (zero)
+        if (netBalances.isEmpty()) {
+            return netBalances;
+        }
+
+        final String targetCurrency = "INR";
+
+        // Subtract already-PAID settlement amounts from net balances so
+        // settled debts don't get recalculated as still owing.
+        if (settlementRecordRepository != null) {
+            try {
+                List<SettlementRecord> paidSettlements = settlementRecordRepository
+                        .findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID);
+                if (paidSettlements != null) {
+                    for (SettlementRecord paid : paidSettlements) {
+                        if (paid.getFromUserId() != null && paid.getToUserId() != null && paid.getAmount() != null) {
+                            // Only apply settlement if at least one party has an active balance in this group
+                            if (!netBalances.containsKey(paid.getFromUserId()) && !netBalances.containsKey(paid.getToUserId())) {
+                                continue;
+                            }
+                            double amount = roundToTwoDecimals(paid.getAmount());
+                            String settlementCurrency = paid.getCurrency() != null && !paid.getCurrency().trim().isEmpty()
+                                    ? paid.getCurrency().trim().toUpperCase()
+                                    : "INR";
+                            if (!settlementCurrency.equalsIgnoreCase(targetCurrency) && currencyConversionService != null) {
+                                double rate = currencyConversionService.getExchangeRate(settlementCurrency, targetCurrency);
+                                amount = roundToTwoDecimals(amount * rate);
+                            }
+                            netBalances.put(paid.getFromUserId(),
+                                    roundToTwoDecimals(netBalances.getOrDefault(paid.getFromUserId(), 0.0) + amount));
+                            netBalances.put(paid.getToUserId(),
+                                    roundToTwoDecimals(netBalances.getOrDefault(paid.getToUserId(), 0.0) - amount));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("[SplitCalculation] Could not query paid settlements for group {}: {}", groupId, e.getMessage());
+            }
+        }
+
+        // Clean up small floating point residues (< 0.005)
+        for (Map.Entry<String, Double> entry : new ArrayList<>(netBalances.entrySet())) {
+            double rounded = roundToTwoDecimals(entry.getValue());
+            if (Math.abs(rounded) < 0.005) {
+                netBalances.put(entry.getKey(), 0.0);
+            } else {
+                netBalances.put(entry.getKey(), rounded);
+            }
+        }
+
+        return netBalances;
+    }
+
+    /**
      * Calculates all settlements needed for a group and persists them to the database.
      *
      * For each bill in the group:
      * - The person who paid (paidBy) is credited with the total amount
      * - Each person who shared items is debited their share
      *
-     * Then simplifyDebts() is called to minimize the number of transactions.
+     * Then PAID settlements are deducted from net balances.
+     * Then simplifyDebts() is called to minimize the number of remaining transactions.
      * The calculated settlements are saved/updated in the database.
      *
      * Personal expenses are excluded entirely (see
@@ -462,28 +712,15 @@ public class SplitCalculationService {
      * @return list of Settlement objects representing the simplified debt structure
      */
     public List<Settlement> getSettlementsForGroup(String groupId) {
-        Map<String, Double> netBalances = calculateNetBalancesForGroup(groupId);
+        final String targetCurrency = "INR";
 
-        // Subtract already-PAID settlement amounts from net balances so
-        // settled debts don't get recalculated as still owing.
-        if (settlementRecordRepository != null) {
-            List<SettlementRecord> paidSettlements = settlementRecordRepository
-                    .findByGroupIdAndStatus(groupId, SettlementRecord.Status.PAID);
-            if (paidSettlements != null) {
-                for (SettlementRecord paid : paidSettlements) {
-                    if (paid.getFromUserId() != null && paid.getToUserId() != null && paid.getAmount() != null) {
-                        double amount = roundToTwoDecimals(paid.getAmount());
-                        netBalances.put(paid.getFromUserId(),
-                                roundToTwoDecimals(netBalances.getOrDefault(paid.getFromUserId(), 0.0) + amount));
-                        netBalances.put(paid.getToUserId(),
-                                roundToTwoDecimals(netBalances.getOrDefault(paid.getToUserId(), 0.0) - amount));
-                    }
-                }
-            }
-        }
+        Map<String, Double> netBalances = calculateRemainingNetBalancesForGroup(groupId);
 
         // Simplify debts to minimize number of transactions
         List<Settlement> settlements = simplifyDebts(netBalances);
+        for (Settlement settlement : settlements) {
+            settlement.setCurrency(targetCurrency);
+        }
 
         // Persist settlements to database
         if (settlementRecordRepository != null) {
@@ -519,16 +756,24 @@ public class SplitCalculationService {
             return true;
         }
 
-        // Collect all unique participant IDs from all items
-        Set<String> participants = new HashSet<>();
+        // Collect all unique persons involved (all item participants + payer)
+        Set<String> persons = new HashSet<>();
+        if (bill.getPaidBy() != null && !bill.getPaidBy().trim().isEmpty()) {
+            persons.add(bill.getPaidBy().trim());
+        }
         for (BillItem item : bill.getItems()) {
             if (item != null && item.getSharedByUserIds() != null) {
-                participants.addAll(item.getSharedByUserIds());
+                for (String uid : item.getSharedByUserIds()) {
+                    if (uid != null && !uid.trim().isEmpty()) {
+                        persons.add(uid.trim());
+                    }
+                }
             }
         }
 
-        // If there's only one unique participant, it's a personal expense
-        return participants.size() <= 1;
+        // If there's only one unique person involved (e.g. payer paid only for themselves),
+        // it's a personal expense that creates no cross-member debt.
+        return persons.size() <= 1;
     }
 
     /**
@@ -539,28 +784,39 @@ public class SplitCalculationService {
      * @param settlements list of settlements to persist
      */
     private void persistSettlements(String groupId, List<Settlement> settlements) {
-        // Delete existing PENDING settlements for this group
-        List<SettlementRecord> existingPending = settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PENDING);
-        if (existingPending != null && !existingPending.isEmpty()) {
-            settlementRecordRepository.deleteAll(existingPending);
+        if (settlementRecordRepository == null || groupId == null || settlements == null) {
+            return;
         }
-
-        // Create new settlement records
-        LocalDateTime now = LocalDateTime.now();
-        for (Settlement settlement : settlements) {
-            SettlementRecord record = new SettlementRecord();
-            record.setGroupId(groupId);
-            record.setFromUserId(settlement.getFromUserId());
-            record.setToUserId(settlement.getToUserId());
-            record.setAmount(settlement.getAmount());
-            record.setStatus(SettlementRecord.Status.PENDING);
-            record.setCreatedAt(now);
-            record.setPaidAt(null);
-            SettlementRecord saved = settlementRecordRepository.save(record);
-            if (saved != null) {
-                settlement.setId(saved.getId());
+        try {
+            // Delete existing PENDING settlements for this group
+            List<SettlementRecord> existingPending = settlementRecordRepository.findByGroupIdAndStatus(groupId, SettlementRecord.Status.PENDING);
+            if (existingPending != null && !existingPending.isEmpty()) {
+                settlementRecordRepository.deleteAll(existingPending);
             }
-            settlement.setStatus("PENDING");
+
+            // Create new settlement records
+            LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+            for (Settlement settlement : settlements) {
+                if (settlement == null || settlement.getFromUserId() == null || settlement.getToUserId() == null) {
+                    continue;
+                }
+                SettlementRecord record = new SettlementRecord();
+                record.setGroupId(groupId);
+                record.setFromUserId(settlement.getFromUserId());
+                record.setToUserId(settlement.getToUserId());
+                record.setAmount(settlement.getAmount());
+                record.setCurrency(settlement.getCurrency() != null ? settlement.getCurrency() : "INR");
+                record.setStatus(SettlementRecord.Status.PENDING);
+                record.setCreatedAt(now);
+                record.setPaidAt(null);
+                SettlementRecord saved = settlementRecordRepository.save(record);
+                if (saved != null) {
+                    settlement.setId(saved.getId());
+                }
+                settlement.setStatus("PENDING");
+            }
+        } catch (Exception e) {
+            log.warn("[SplitCalculation] Could not persist pending settlements for group {}: {}", groupId, e.getMessage());
         }
     }
 }

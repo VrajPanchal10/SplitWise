@@ -14,6 +14,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,6 +29,10 @@ public class GroupService {
     private final ActivityService activityService;
 
     public Group createGroup(String name, List<String> memberIds, String createdBy) {
+        return createGroup(name, memberIds, createdBy, "INR");
+    }
+
+    public Group createGroup(String name, List<String> memberIds, String createdBy, String defaultCurrency) {
         List<String> members = Optional.ofNullable(memberIds).orElse(List.of());
         if (!members.contains(createdBy)) {
             members = new java.util.ArrayList<>(members);
@@ -38,7 +43,8 @@ public class GroupService {
         group.setName(name);
         group.setMemberIds(members);
         group.setCreatedBy(createdBy);
-        group.setCreatedAt(LocalDateTime.now());
+        group.setCreatedAt(LocalDateTime.now(ZoneOffset.UTC));
+        group.setDefaultCurrency(defaultCurrency != null && !defaultCurrency.trim().isEmpty() ? defaultCurrency.trim().toUpperCase() : "INR");
 
         Group saved = groupRepository.save(group);
 

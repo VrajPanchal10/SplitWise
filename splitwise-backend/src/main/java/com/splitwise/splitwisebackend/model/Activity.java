@@ -39,11 +39,18 @@ public class Activity {
     /** Group this activity relates to, if any. */
     private String relatedGroupId;
 
+    /** Group name for fast display, if any. */
+    private String groupName;
+
     /** Bill/expense this activity relates to, if any. */
     private String relatedBillId;
+
+    /** Settlement or expense amount, if any. */
+    private Double amount;
 
     /** Who performed the action (may differ from userId for shared activities). */
     private String actorUserId;
 
+    @com.fasterxml.jackson.annotation.JsonFormat(shape = com.fasterxml.jackson.annotation.JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
     private LocalDateTime createdAt;
 }

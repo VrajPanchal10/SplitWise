@@ -1,12 +1,22 @@
 import { useState, useCallback, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Alert, Image } from 'react-native';
-import { ChevronLeft, Pencil, Trash2, Receipt, UtensilsCrossed, Car, Film } from 'lucide-react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Alert, Image, DeviceEventEmitter } from 'react-native';
+import { ChevronLeft, Pencil, Trash2, Receipt } from 'lucide-react-native';
 import { theme } from '@/constants/theme';
 import { ZigzagEdge } from '@/components/ZigzagEdge';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../../context/AuthContext';
 import apiClient from '../../services/apiClient';
 import { calculateBillBreakdown } from '../../utils/splitCalculator';
+import { formatDate } from '../../utils/dateUtils';
+import {
+  SUPPORTED_CURRENCIES,
+  getCurrencyConfig,
+  getCurrencySymbol,
+  formatMoney,
+  formatDualCurrency,
+  getApproximateRate,
+} from '@/constants/currencies';
+import { getCategoryByKey } from '@/constants/categories';
 
 interface BillItem {
   name: string;
@@ -18,11 +28,17 @@ interface Bill {
   id: string;
   title: string;
   totalAmount: number;
+  currency?: string;
+  baseCurrency?: string;
+  exchangeRate?: number;
+  exchangeRateDate?: string;
+  convertedAmount?: number;
   groupId: string | null;
   paidBy: string;
   items: BillItem[];
   receiptUrl?: string;
   createdAt: string;
+  category?: string;
 }
 
 interface ShareBreakdown {
@@ -31,21 +47,12 @@ interface ShareBreakdown {
   paidAmount: number;
   shareAmount: number;
   netAmount: number;
+  convertedShareAmount?: number;
+  convertedNetAmount?: number;
   profilePictureUrl?: string;
 }
 
-const getCategoryConfig = (category: string) => {
-  switch (category) {
-    case 'food':
-      return { icon: UtensilsCrossed, tint: theme.colors.foodTint, color: theme.colors.primary };
-    case 'travel':
-      return { icon: Car, tint: theme.colors.travelTint, color: theme.colors.success };
-    case 'entertainment':
-      return { icon: Film, tint: theme.colors.entertainmentTint, color: '#B45309' };
-    default:
-      return { icon: Receipt, tint: theme.colors.border, color: theme.colors.textSecondary };
-  }
-};
+// Category config is now resolved dynamically from getCategoryByKey()
 
 // calculateUserShare is now handled by the deterministic splitCalculator utility
 
@@ -111,12 +118,16 @@ export default function BillDetailScreen() {
         } catch (error) {
           console.error(`Error fetching user ${p.userId}:`, error);
         }
+        const hasConversion = billData.currency && billData.baseCurrency && billData.currency !== billData.baseCurrency;
+        const rate = billData.exchangeRate || 1;
         breakdown.push({
           userId: p.userId,
           name,
           paidAmount: p.paidAmount,
           shareAmount: p.shareAmount,
           netAmount: p.netAmount,
+          convertedShareAmount: hasConversion ? Math.round(p.shareAmount * rate * 100) / 100 : undefined,
+          convertedNetAmount: hasConversion ? Math.round(p.netAmount * rate * 100) / 100 : undefined,
           profilePictureUrl,
         });
       }
@@ -163,7 +174,10 @@ export default function BillDetailScreen() {
           onPress: async () => {
             try {
               setIsDeleting(true);
+              const deletedGroupId = bill.groupId;
+              const deletedBillId = bill.id;
               await apiClient.delete(`/bills/${bill.id}`);
+              DeviceEventEmitter.emit('bill:deleted', { groupId: deletedGroupId, billId: deletedBillId });
               router.back();
             } catch (error: any) {
               console.error('Error deleting bill:', error);
@@ -198,8 +212,7 @@ export default function BillDetailScreen() {
     );
   }
 
-  const config = getCategoryConfig('food');
-  const Icon = config.icon;
+  const catConfig = getCategoryByKey(bill.category);
   const isPayer = user?.id === bill.paidBy;
 
   return (
@@ -220,13 +233,25 @@ export default function BillDetailScreen() {
 
         {/* Bill Summary */}
         <View style={styles.heroBill}>
-          <View style={[styles.billIconContainer, { backgroundColor: config.tint }]}>
-            <Icon size={24} color={config.color} />
+          <View style={[styles.billIconContainer, { backgroundColor: catConfig.tint }]}>
+            <Text style={{ fontSize: 24 }}>{catConfig.emoji}</Text>
           </View>
           <Text style={styles.billTitle} numberOfLines={2}>{bill.title}</Text>
-          <Text style={styles.billAmount}>₹{bill.totalAmount.toLocaleString()}</Text>
+          <Text style={styles.billAmount}>
+            {formatMoney(bill.totalAmount, bill.currency || 'INR', true)}
+          </Text>
+          {bill.currency && bill.currency.toUpperCase() !== 'INR' && (
+            <View style={styles.heroConversionBadge}>
+              <Text style={styles.heroConversionText}>
+                ≈ {formatMoney(bill.convertedAmount || (bill.totalAmount * (bill.exchangeRate || getApproximateRate(bill.currency, 'INR'))), 'INR', true)}
+              </Text>
+              <Text style={styles.heroRateText}>
+                (1 {bill.currency} = {bill.exchangeRate || getApproximateRate(bill.currency, 'INR')} INR)
+              </Text>
+            </View>
+          )}
           <Text style={styles.billMeta}>
-            {new Date(bill.createdAt).toLocaleDateString()} · Paid by {paidByName}
+            {formatDate(bill.createdAt)} · Paid by {paidByName}
           </Text>
         </View>
 
@@ -262,12 +287,22 @@ export default function BillDetailScreen() {
                         {share.userId === user?.id ? 'You' : share.name}
                       </Text>
                       <Text style={styles.sharePaidLabel}>
-                        Paid: ₹{share.paidAmount.toFixed(2)}
+                        Paid: {formatMoney(share.paidAmount, bill.currency || 'INR')}
                       </Text>
                     </View>
                   </View>
                   <View style={styles.shareAmountColumn}>
-                    <Text style={styles.shareAmount}>₹{share.shareAmount.toFixed(2)}</Text>
+                    <Text style={styles.shareAmount}>{formatMoney(share.shareAmount, bill.currency || 'INR')}</Text>
+                    {bill.currency && bill.currency.toUpperCase() !== 'INR' && (
+                      <Text style={styles.shareConvertedText}>
+                        ≈ {formatMoney(
+                          share.convertedShareAmount != null
+                            ? share.convertedShareAmount
+                            : Math.round(share.shareAmount * (bill.exchangeRate || getApproximateRate(bill.currency, 'INR')) * 100) / 100,
+                          'INR'
+                        )}
+                      </Text>
+                    )}
                     <View style={[
                       styles.netBadge,
                       share.netAmount > 0 ? styles.netBadgePositive
@@ -281,9 +316,27 @@ export default function BillDetailScreen() {
                           : styles.netTextZero
                       ]}>
                         {share.netAmount > 0
-                          ? `gets back ₹${share.netAmount.toFixed(2)}`
+                          ? `gets back ${formatMoney(share.netAmount, bill.currency || 'INR')}${
+                              bill.currency && bill.currency.toUpperCase() !== 'INR'
+                                ? ` (≈ ${formatMoney(
+                                    share.convertedNetAmount ??
+                                      Math.round(share.netAmount * (bill.exchangeRate || getApproximateRate(bill.currency, 'INR')) * 100) / 100,
+                                    'INR'
+                                  )})`
+                                : ''
+                            }`
                           : share.netAmount < 0
-                          ? `owes ₹${Math.abs(share.netAmount).toFixed(2)}`
+                          ? `owes ${formatMoney(Math.abs(share.netAmount), bill.currency || 'INR')}${
+                              bill.currency && bill.currency.toUpperCase() !== 'INR'
+                                ? ` (≈ ${formatMoney(
+                                    Math.abs(
+                                      share.convertedNetAmount ??
+                                        Math.round(share.netAmount * (bill.exchangeRate || getApproximateRate(bill.currency, 'INR')) * 100) / 100
+                                    ),
+                                    'INR'
+                                  )})`
+                                : ''
+                            }`
                           : 'settled'}
                       </Text>
                     </View>
@@ -309,7 +362,7 @@ export default function BillDetailScreen() {
                         Split between {item.sharedByUserIds?.length || 0} people
                       </Text>
                     </View>
-                    <Text style={styles.itemPrice}>₹{item.price.toFixed(2)}</Text>
+                    <Text style={styles.itemPrice}>{formatMoney(item.price, bill.currency || 'INR')}</Text>
                   </View>
                   {index < bill.items.length - 1 && <View style={styles.itemDivider} />}
                 </View>
@@ -440,6 +493,26 @@ const styles = StyleSheet.create({
     fontFamily: theme.fontFamily.mono,
     marginBottom: theme.spacing[4],
   },
+  heroConversionBadge: {
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  heroConversionText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: theme.colors.cream,
+    fontFamily: theme.fontFamily.regular,
+  },
+  heroRateText: {
+    fontSize: 11,
+    color: theme.colors.heroMuted,
+    fontFamily: theme.fontFamily.mono,
+    marginTop: 2,
+  },
   billMeta: {
     fontSize: 13,
     color: theme.colors.heroMuted,
@@ -525,6 +598,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: theme.colors.textPrimary,
+    fontFamily: theme.fontFamily.mono,
+  },
+  shareConvertedText: {
+    fontSize: 11,
+    color: theme.colors.textSecondary,
     fontFamily: theme.fontFamily.mono,
   },
   netBadge: {

@@ -56,27 +56,33 @@ public class OcrService {
             tempFile = File.createTempFile("ocr_upload_", "_" + imageFile.getOriginalFilename());
             imageFile.transferTo(tempFile);
 
-            // Normalize the image: re-encode as clean JPEG to fix malformed headers
-            // (e.g., "JFIF APP0 must be first marker after SOI" from mobile cameras)
-            // The TwelveMonkeys ImageIO plugin (on classpath) provides a more lenient
-            // JPEG decoder. We also re-encode to produce a standard-compliant JPEG.
-            File normalizedFile = normalizeImage(tempFile);
-            if (normalizedFile != null) {
-                tempFile = normalizedFile;
+            // Read the image using ImageIO (TwelveMonkeys on classpath provides lenient decoding)
+            BufferedImage rawImage = null;
+            try {
+                rawImage = ImageIO.read(tempFile);
+            } catch (Exception e) {
+                log.warn("Direct ImageIO.read failed on {}, falling back to normalization: {}",
+                        tempFile.getName(), e.getMessage());
             }
 
-            // Preprocess the image for OCR:
-            // 1. Upscale if the width is below MIN_OCR_WIDTH (fixes "Image too
-            // small to scale" / "Line cannot be recognized")
-            // 2. Convert to grayscale (Tesseract performs far better on
-            // grayscale/binarized images than raw color photos)
-            // 3. Apply subtle contrast enhancement to make text pop
-            // Returns a BufferedImage; orientation is handled by multi-angle OCR.
-            BufferedImage preprocessed = preprocessForOcr(tempFile);
-            if (preprocessed == null) {
-                log.warn("Preprocessing returned null, reading raw normalized file instead");
-                preprocessed = ImageIO.read(tempFile);
+            // Fallback normalization only if direct read failed
+            if (rawImage == null) {
+                File normalizedFile = normalizeImage(tempFile);
+                if (normalizedFile != null) {
+                    tempFile = normalizedFile;
+                    rawImage = ImageIO.read(tempFile);
+                }
             }
+
+            if (rawImage == null) {
+                throw new ApiException("Could not decode receipt image format", HttpStatus.BAD_REQUEST);
+            }
+
+            // Preprocess image in-memory for OCR:
+            // 1. Upscale if below MIN_OCR_WIDTH
+            // 2. Convert to grayscale
+            // 3. Dynamic contrast enhancement (histogram stretch)
+            BufferedImage preprocessed = preprocessImage(rawImage);
 
             // Initialize Tesseract with the tessdata path and proper engine config
             Tesseract tesseract = new Tesseract();
@@ -96,12 +102,12 @@ public class OcrService {
             tesseract.setPageSegMode(ITessAPI.TessPageSegMode.PSM_SINGLE_BLOCK);
             // LSTM-only engine (faster, more accurate for printed receipts)
             tesseract.setOcrEngineMode(ITessAPI.TessOcrEngineMode.OEM_LSTM_ONLY);
+            // Preserve interword column spacing so item names and prices do not collide
+            tesseract.setTessVariable("preserve_interword_spaces", "1");
 
-            // Run OCR on the preprocessed grayscale image directly (single pass).
-            // Multi-rotation adds complexity without benefit for now; we focus
-            // on getting one clean, correctly-oriented grayscale image to
-            // Tesseract first.
-            String result = tesseract.doOCR(preprocessed);
+            // Adaptive orientation: run 0° first. If clear text is found (score >= 15),
+            // return immediately. Otherwise fallback to testing 90°, 180°, 270°.
+            String result = runAdaptiveOcr(tesseract, preprocessed);
             log.info("Raw OCR text:\n{}", result);
             return result.trim();
 
@@ -133,8 +139,6 @@ public class OcrService {
         try {
             log.info("Normalizing image: {}", inputFile.getName());
 
-            // Read the image using ImageIO (TwelveMonkeys plugin provides lenient JPEG
-            // decoding)
             BufferedImage image = ImageIO.read(inputFile);
             if (image == null) {
                 log.warn("ImageIO.read returned null for {}, skipping normalization", inputFile.getName());
@@ -164,121 +168,159 @@ public class OcrService {
     }
 
     /**
-     * Preprocesses an image for OCR:
-     * <ol>
-     * <li><b>Upscale</b> - if the image width is below {@link #MIN_OCR_WIDTH},
-     * scales it up (bicubic interpolation) to {@link #TARGET_OCR_WIDTH} px
-     * wide, maintaining aspect ratio. This directly addresses Tesseract's
-     * "Image too small to scale" / "Line cannot be recognized" warnings.</li>
-     * <li><b>Grayscale</b> - converts to TYPE_BYTE_GRAY. Tesseract recognizes
-     * text much more reliably on grayscale than raw color photos.</li>
-     * <li><b>Contrast enhancement</b> - applies a RescaleOp that slightly
-     * brightens and increases contrast so faint/dark thermal-print text
-     * stands out from the paper background.</li>
-     * </ol>
-     *
-     * The preprocessed result is saved to a new temp file and returned.
-     * If processing fails for any reason, returns null so the caller falls
-     * back to the input as-is.
+     * Preprocesses an in-memory BufferedImage for OCR:
+     * 1. Upscale if below MIN_OCR_WIDTH
+     * 2. Convert to grayscale
+     * 3. Dynamic contrast stretch (histogram percentiles)
      */
+    public BufferedImage preprocessImage(BufferedImage image) {
+        int originalWidth = image.getWidth();
+        int originalHeight = image.getHeight();
+        log.info("Original image dimensions: {}x{}", originalWidth, originalHeight);
+
+        // ---- Step 1: Upscale if below minimum resolution ----
+        BufferedImage workingImage = image;
+        if (originalWidth < MIN_OCR_WIDTH) {
+            double scale = (double) TARGET_OCR_WIDTH / originalWidth;
+            int newWidth = TARGET_OCR_WIDTH;
+            int newHeight = (int) Math.round(originalHeight * scale);
+            if (newHeight < 1) newHeight = 1;
+
+            log.info("Upscaling image from {}x{} to {}x{} (scale={})",
+                    originalWidth, originalHeight, newWidth, newHeight, String.format("%.2f", scale));
+
+            workingImage = new BufferedImage(newWidth, newHeight, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g2d = workingImage.createGraphics();
+            try {
+                g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2d.drawImage(image, 0, 0, newWidth, newHeight, null);
+            } finally {
+                g2d.dispose();
+            }
+        }
+
+        // ---- Step 2: Convert to grayscale ----
+        BufferedImage grayImage = new BufferedImage(
+                workingImage.getWidth(), workingImage.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D grayG2d = grayImage.createGraphics();
+        try {
+            grayG2d.drawImage(workingImage, 0, 0, null);
+        } finally {
+            grayG2d.dispose();
+        }
+
+        // ---- Step 3: Dynamic contrast enhancement ----
+        BufferedImage enhancedImage = enhanceContrast(grayImage);
+        log.info("Preprocessed image ready: {}x{}", enhancedImage.getWidth(), enhancedImage.getHeight());
+        return enhancedImage;
+    }
+
     private BufferedImage preprocessForOcr(File inputFile) {
         try {
-            log.info("Preprocessing image for OCR: {}", inputFile.getName());
-
             BufferedImage image = ImageIO.read(inputFile);
-            if (image == null) {
-                log.warn("ImageIO.read returned null for {}, skipping preprocessing", inputFile.getName());
-                return null;
-            }
-
-            int originalWidth = image.getWidth();
-            int originalHeight = image.getHeight();
-            log.info("Original image dimensions: {}x{}", originalWidth, originalHeight);
-
-            // ---- Step 1: Upscale if below minimum resolution ----
-            BufferedImage workingImage = image;
-            if (originalWidth < MIN_OCR_WIDTH) {
-                double scale = (double) TARGET_OCR_WIDTH / originalWidth;
-                int newWidth = TARGET_OCR_WIDTH;
-                int newHeight = (int) Math.round(originalHeight * scale);
-                // Guard against absurd aspect ratios producing a degenerate height
-                if (newHeight < 1)
-                    newHeight = 1;
-
-                log.info("Upscaling image from {}x{} to {}x{} (scale={})",
-                        originalWidth, originalHeight, newWidth, newHeight, String.format("%.2f", scale));
-
-                workingImage = new BufferedImage(newWidth, newHeight, BufferedImage.TYPE_INT_RGB);
-                Graphics2D g2d = workingImage.createGraphics();
-                try {
-                    g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                            RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-                    g2d.setRenderingHint(RenderingHints.KEY_RENDERING,
-                            RenderingHints.VALUE_RENDER_QUALITY);
-                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
-                            RenderingHints.VALUE_ANTIALIAS_ON);
-                    g2d.drawImage(image, 0, 0, newWidth, newHeight, null);
-                } finally {
-                    g2d.dispose();
-                }
-            } else {
-                log.info("Image width {} is already >= {}, skipping upscale", originalWidth, MIN_OCR_WIDTH);
-            }
-
-            // NOTE: Hard-rotating landscape photos here produced EMPTY OCR on
-            // real scans because EXIF orientation/crop direction varies. We
-            // intentionally do NOT rotate here; multi-angle OCR in
-            // runOcrOnAllRotations() tries all four rotations instead.
-
-            // ---- Step 2: Convert to grayscale ----
-            BufferedImage grayImage = new BufferedImage(
-                    workingImage.getWidth(), workingImage.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
-            Graphics2D grayG2d = grayImage.createGraphics();
-            try {
-                grayG2d.drawImage(workingImage, 0, 0, null);
-            } finally {
-                grayG2d.dispose();
-            }
-
-            // ---- Step 3: Mild contrast stretch (NOT hard thresholding) ----
-            // A gentle linear rescale that brightens blacks slightly and
-            // stretches the dynamic range so faint text becomes more distinct.
-            // We deliberately do NOT binarize here: a naive fixed black/white
-            // threshold destroys text on unevenly-lit or slightly-blurry phone
-            // photos)Skip. Tesseract has its own internal adaptive binarization
-            // and works best on clean grayscale input.
-            float scaleFactor = 1.1f;
-            float offset = 8f;
-            RescaleOp rescale = new RescaleOp(scaleFactor, offset, null);
-            BufferedImage enhancedImage = rescale.filter(grayImage, null);
-
-            log.info("Preprocessed image ready (grayscale): {}x{}",
-                    enhancedImage.getWidth(), enhancedImage.getHeight());
-            return enhancedImage;
+            if (image == null) return null;
+            return preprocessImage(image);
         } catch (IOException e) {
-            log.warn("Failed to preprocess image {}, falling back to original: {}", inputFile.getName(),
-                    e.getMessage());
+            log.warn("Failed to preprocess image {}, falling back to original: {}", inputFile.getName(), e.getMessage());
             return null;
         }
     }
 
     /**
-     * Runs Tesseract on the image in 0°, 90°, 180°, and 270° rotations and
-     * returns the text from the rotation that contains the most English words.
-     * This eliminates all orientation guesswork (EXIF, crop direction,
-     * upside-down photos) without requiring osd.traineddata.
+     * Stretches the dynamic range of a grayscale image using histogram percentiles
+     * (2% low, 98% high), making faint receipts much more readable for OCR.
      */
-    private String runOcrOnAllRotations(Tesseract tesseract, BufferedImage src) throws TesseractException {
-        String bestText = "";
-        int bestScore = -1;
+    private BufferedImage enhanceContrast(BufferedImage gray) {
+        try {
+            int width = gray.getWidth();
+            int height = gray.getHeight();
+            int totalPixels = width * height;
 
-        for (int angle : ROTATION_ANGLES) {
-            BufferedImage rotated = (angle == 0) ? src : rotate(src, angle);
+            int[] hist = new int[256];
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int pixel = gray.getRaster().getSample(x, y, 0);
+                    hist[pixel & 0xFF]++;
+                }
+            }
 
+            int lowCut = (int) (totalPixels * 0.02);
+            int highCut = (int) (totalPixels * 0.98);
+
+            int low = 0;
+            int count = 0;
+            for (int i = 0; i < 256; i++) {
+                count += hist[i];
+                if (count >= lowCut) {
+                    low = i;
+                    break;
+                }
+            }
+
+            count = 0;
+            int high = 255;
+            for (int i = 255; i >= 0; i--) {
+                count += hist[i];
+                if (count >= (totalPixels - highCut)) {
+                    high = i;
+                    break;
+                }
+            }
+
+            // If range is already broad or invalid, fall back to mild rescale
+            if (high <= low || (high - low) > 230) {
+                RescaleOp rescale = new RescaleOp(1.1f, 8f, null);
+                return rescale.filter(gray, null);
+            }
+
+            byte[] lut = new byte[256];
+            for (int i = 0; i < 256; i++) {
+                if (i <= low) {
+                    lut[i] = 0;
+                } else if (i >= high) {
+                    lut[i] = (byte) 255;
+                } else {
+                    lut[i] = (byte) Math.min(255, Math.max(0, (i - low) * 255 / (high - low)));
+                }
+            }
+
+            java.awt.image.ByteLookupTable lookupTable = new java.awt.image.ByteLookupTable(0, lut);
+            java.awt.image.LookupOp op = new java.awt.image.LookupOp(lookupTable, null);
+            return op.filter(gray, null);
+        } catch (Exception e) {
+            log.warn("Dynamic contrast stretch failed, falling back to RescaleOp: {}", e.getMessage());
+            RescaleOp rescale = new RescaleOp(1.1f, 8f, null);
+            return rescale.filter(gray, null);
+        }
+    }
+
+    /**
+     * Runs Tesseract with smart orientation detection:
+     * Tries standard 0° first. If clear text is detected (score >= 15), returns immediately.
+     * Only if the image appears sideways or upside-down (score < 15), tries 90°, 180°, and 270°.
+     */
+    private String runAdaptiveOcr(Tesseract tesseract, BufferedImage src) throws TesseractException {
+        // Fast path: try 0 degrees
+        String text0 = tesseract.doOCR(src);
+        int score0 = textQualityScore(text0);
+        log.info("OCR @0° -> score={}, length={}", score0, text0 == null ? 0 : text0.length());
+
+        if (score0 >= 15) {
+            return text0 == null ? "" : text0;
+        }
+
+        log.info("0° OCR quality score {} < 15, attempting rotations (90°, 180°, 270°)", score0);
+        String bestText = text0 == null ? "" : text0;
+        int bestScore = score0;
+
+        int[] otherAngles = { 90, 180, 270 };
+        for (int angle : otherAngles) {
+            BufferedImage rotated = rotate(src, angle);
             String text = tesseract.doOCR(rotated);
             int score = textQualityScore(text);
-            log.info("OCR @{}° -> score={}, length={}\n{}",
-                    angle, score, text == null ? 0 : text.length(), text);
+            log.info("OCR @{}° -> score={}, length={}", angle, score, text == null ? 0 : text.length());
 
             if (text != null && score > bestScore) {
                 bestScore = score;
@@ -286,9 +328,16 @@ public class OcrService {
             }
         }
 
-        log.info("Chose rotation with score {} (text length {})",
-                bestScore, bestText == null ? 0 : bestText.length());
+        log.info("Selected rotation with best score {}", bestScore);
         return bestText == null ? "" : bestText;
+    }
+
+    /**
+     * Runs Tesseract on the image in 0°, 90°, 180°, and 270° rotations and
+     * returns the text from the rotation that contains the most English words.
+     */
+    private String runOcrOnAllRotations(Tesseract tesseract, BufferedImage src) throws TesseractException {
+        return runAdaptiveOcr(tesseract, src);
     }
 
     /**

@@ -182,7 +182,8 @@ export function calculateBillBreakdown(
  */
 export function validateCustomShares(
   shares: Record<string, number>,
-  expectedTotal: number
+  expectedTotal: number,
+  currencySymbol: string = '₹'
 ): { isValid: boolean; sum: number; difference: number; message?: string } {
   let sum = 0;
   for (const [uid, amount] of Object.entries(shares)) {
@@ -207,8 +208,8 @@ export function validateCustomShares(
       sum,
       difference: diff,
       message: diff > 0
-        ? `Remaining to allocate: ₹${diff.toFixed(2)}`
-        : `Exceeds bill total by ₹${Math.abs(diff).toFixed(2)}`,
+        ? `Remaining to allocate: ${currencySymbol}${diff.toFixed(2)}`
+        : `Exceeds bill total by ${currencySymbol}${Math.abs(diff).toFixed(2)}`,
     };
   }
 

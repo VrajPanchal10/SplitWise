@@ -64,16 +64,19 @@ export default function AuthScreen({ initialTab = 'signup' }: AuthScreenProps) {
     // Clear previous error
     setError(null);
 
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanFullName = fullName.trim();
+
     // Validate fields
-    if (!email || !password) {
+    if (!cleanEmail || !password) {
       setError('Please fill in all required fields');
       return;
     }
-    if (activeTab === 'signup' && !fullName) {
+    if (activeTab === 'signup' && !cleanFullName) {
       setError('Please enter your full name');
       return;
     }
-    if (!validateEmail(email)) {
+    if (!validateEmail(cleanEmail)) {
       setError('Please enter a valid email address');
       return;
     }
@@ -86,9 +89,9 @@ export default function AuthScreen({ initialTab = 'signup' }: AuthScreenProps) {
 
     try {
       if (activeTab === 'signup') {
-        await signup(fullName, email, password);
+        await signup(cleanFullName, cleanEmail, password);
       } else {
-        await login(email, password);
+        await login(cleanEmail, password);
       }
       // On success, navigate to tabs
       router.replace('/(tabs)');

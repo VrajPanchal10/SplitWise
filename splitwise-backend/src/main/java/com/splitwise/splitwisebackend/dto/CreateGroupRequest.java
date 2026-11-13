@@ -10,4 +10,5 @@ public class CreateGroupRequest {
     @NotBlank(message = "Group name is required")
     private String name;
     private List<String> memberIds;
+    private String defaultCurrency;
 }

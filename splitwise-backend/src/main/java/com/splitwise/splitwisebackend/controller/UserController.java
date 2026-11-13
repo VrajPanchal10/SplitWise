@@ -2,6 +2,7 @@ package com.splitwise.splitwisebackend.controller;
 
 import com.splitwise.splitwisebackend.dto.UserResponse;
 import com.splitwise.splitwisebackend.dto.UserStats;
+import com.splitwise.splitwisebackend.exception.ApiException;
 import com.splitwise.splitwisebackend.model.FriendBalance;
 import com.splitwise.splitwisebackend.model.User;
 import com.splitwise.splitwisebackend.repository.UserRepository;
@@ -10,12 +11,14 @@ import com.splitwise.splitwisebackend.service.UserService;
 import lombok.extern.slf4j.Slf4j;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @RestController
@@ -27,6 +30,18 @@ public class UserController {
     private final UserService userService;
     private final UserRepository userRepository;
     private final ActivityService activityService;
+
+    private UserResponse toUserResponse(User user) {
+        return new UserResponse(
+                user.getId(),
+                user.getFullName(),
+                user.getEmail(),
+                user.getProfilePictureUrl(),
+                user.getPaymentQrUrl(),
+                user.getCreatedAt() != null ? user.getCreatedAt().toString() : null,
+                user.getDefaultCurrency() != null ? user.getDefaultCurrency() : "INR"
+        );
+    }
 
     private String getCurrentUserId() {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
@@ -40,44 +55,33 @@ public class UserController {
     public ResponseEntity<UserResponse> getCurrentUserProfile() {
         String userId = getCurrentUserId();
         User user = userService.getUserById(userId);
-        UserResponse response = new UserResponse(
-                user.getId(),
-                user.getFullName(),
-                user.getEmail(),
-                user.getProfilePictureUrl(),
-                user.getPaymentQrUrl(),
-                user.getCreatedAt() != null ? user.getCreatedAt().toString() : null
-        );
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(toUserResponse(user));
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<UserResponse> getUserById(@PathVariable String id) {
+    public ResponseEntity<UserResponse> getUserById(@PathVariable("id") String id) {
         User user = userService.getUserById(id);
-        UserResponse response = new UserResponse(
-                user.getId(),
-                user.getFullName(),
-                user.getEmail(),
-                user.getProfilePictureUrl(),
-                user.getPaymentQrUrl(),
-                user.getCreatedAt() != null ? user.getCreatedAt().toString() : null
-        );
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(toUserResponse(user));
     }
 
     @PutMapping("/me")
     public ResponseEntity<UserResponse> updateCurrentUserProfile(@Valid @RequestBody UpdateProfileRequest request) {
         String userId = getCurrentUserId();
         User updatedUser = userService.updateProfile(userId, request.getFullName());
-        UserResponse response = new UserResponse(
-                updatedUser.getId(),
-                updatedUser.getFullName(),
-                updatedUser.getEmail(),
-                updatedUser.getProfilePictureUrl(),
-                updatedUser.getPaymentQrUrl(),
-                updatedUser.getCreatedAt() != null ? updatedUser.getCreatedAt().toString() : null
-        );
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(toUserResponse(updatedUser));
+    }
+
+    @PutMapping("/me/currency")
+    public ResponseEntity<UserResponse> updateCurrency(@RequestBody Map<String, String> request) {
+        String userId = getCurrentUserId();
+        String currency = request.get("currency");
+        if (currency == null || currency.trim().isEmpty()) {
+            throw new ApiException("Currency cannot be empty", HttpStatus.BAD_REQUEST);
+        }
+        User user = userService.getUserById(userId);
+        user.setDefaultCurrency(currency.trim().toUpperCase());
+        User updatedUser = userRepository.save(user);
+        return ResponseEntity.ok(toUserResponse(updatedUser));
     }
 
     @PutMapping("/me/profile-picture")
@@ -96,15 +100,7 @@ public class UserController {
                 null,
                 userId);
         log.info("Activity logged: You updated your profile photo");
-        UserResponse response = new UserResponse(
-                updatedUser.getId(),
-                updatedUser.getFullName(),
-                updatedUser.getEmail(),
-                updatedUser.getProfilePictureUrl(),
-                updatedUser.getPaymentQrUrl(),
-                updatedUser.getCreatedAt() != null ? updatedUser.getCreatedAt().toString() : null
-        );
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(toUserResponse(updatedUser));
     }
 
     @PutMapping("/me/payment-qr")
@@ -113,15 +109,7 @@ public class UserController {
         User user = userService.getUserById(userId);
         user.setPaymentQrUrl(request.getPaymentQrUrl());
         User updatedUser = userRepository.save(user);
-        UserResponse response = new UserResponse(
-                updatedUser.getId(),
-                updatedUser.getFullName(),
-                updatedUser.getEmail(),
-                updatedUser.getProfilePictureUrl(),
-                updatedUser.getPaymentQrUrl(),
-                updatedUser.getCreatedAt() != null ? updatedUser.getCreatedAt().toString() : null
-        );
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(toUserResponse(updatedUser));
     }
 
     @GetMapping("/me/stats")
@@ -132,18 +120,10 @@ public class UserController {
     }
 
     @GetMapping("/search")
-    public ResponseEntity<UserResponse> searchUserByEmail(@RequestParam String email) {
+    public ResponseEntity<UserResponse> searchUserByEmail(@RequestParam("email") String email) {
         User user = userRepository.findByEmail(email)
                 .orElseThrow(() -> new RuntimeException("User not found with email: " + email));
-        UserResponse response = new UserResponse(
-                user.getId(),
-                user.getFullName(),
-                user.getEmail(),
-                user.getProfilePictureUrl(),
-                user.getPaymentQrUrl(),
-                user.getCreatedAt() != null ? user.getCreatedAt().toString() : null
-        );
-        return ResponseEntity.ok(response);
+        return ResponseEntity.ok(toUserResponse(user));
     }
 
     @GetMapping("/me/friends")
@@ -152,14 +132,8 @@ public class UserController {
         List<String> friendIds = userService.getFriendIds(userId);
         List<User> friends = userRepository.findAllById(friendIds);
         List<UserResponse> response = friends.stream()
-                .map(user -> new UserResponse(
-                        user.getId(),
-                        user.getFullName(),
-                        user.getEmail(),
-                        user.getProfilePictureUrl(),
-                        user.getPaymentQrUrl(),
-                        user.getCreatedAt() != null ? user.getCreatedAt().toString() : null
-                ))
+                .filter(user -> user.getId() != null && !user.getId().trim().equals(userId.trim()))
+                .map(this::toUserResponse)
                 .collect(Collectors.toList());
         return ResponseEntity.ok(response);
     }

@@ -17,11 +17,14 @@ public class Settlement {
     private String toUserName;
     private Double amount;
     private String status;
+    @Builder.Default
+    private String currency = "INR";
 
     public Settlement(String fromUserId, String toUserId, Double amount) {
         this.fromUserId = fromUserId;
         this.toUserId = toUserId;
         this.amount = amount;
         this.status = "PENDING";
+        this.currency = "INR";
     }
 }

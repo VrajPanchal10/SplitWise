@@ -3,24 +3,46 @@ const { execSync, spawn } = require("child_process");
 function getLocalIPv4() {
   const output = execSync("ipconfig", { encoding: "utf8" });
 
-  const matches = output.match(
-    /IPv4 Address[.\s]*:\s*(\d+\.\d+\.\d+\.\d+)/gi
-  );
+  const blocks = output.split(/\r?\n\r?\n/);
+  const candidates = [];
 
-  if (!matches || matches.length === 0) {
-    throw new Error("Could not detect a local IPv4 address.");
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const header = lines[0] || "";
+
+    if (/Media disconnected/i.test(block)) continue;
+    if (/vEthernet|VirtualBox|VMware|Loopback/i.test(header)) continue;
+
+    const ipv4Match = block.match(/IPv4 Address[.\s]*:\s*(\d+\.\d+\.\d+\.\d+)/i);
+    const gatewayMatch = block.match(/Default Gateway[.\s]*:\s*(\S+)/i);
+    const hasGateway = !!(gatewayMatch && gatewayMatch[1] && gatewayMatch[1] !== "");
+
+    if (ipv4Match) {
+      const ip = ipv4Match[1];
+      if (!ip.startsWith("127.")) {
+        candidates.push({
+          ip,
+          header,
+          hasGateway,
+          isWifi: /Wi-Fi|Wireless/i.test(header),
+          isHotspot: /Local Area Connection\*/i.test(header) || ip.startsWith("192.168.137."),
+        });
+      }
+    }
   }
 
-  const ips = matches
-    .map((line) => line.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1])
-    .filter(Boolean)
-    .filter((ip) => !ip.startsWith("127."));
+  candidates.sort((a, b) => {
+    if (a.hasGateway !== b.hasGateway) return b.hasGateway ? 1 : -1;
+    if (a.isHotspot !== b.isHotspot) return a.isHotspot ? 1 : -1;
+    if (a.isWifi !== b.isWifi) return b.isWifi ? 1 : -1;
+    return 0;
+  });
 
-  if (ips.length === 0) {
-    throw new Error("Could not find a usable IPv4 address.");
+  if (candidates.length > 0) {
+    return candidates[0].ip;
   }
 
-  return ips[0];
+  throw new Error("Could not detect a usable local IPv4 address.");
 }
 
 const ip = getLocalIPv4();

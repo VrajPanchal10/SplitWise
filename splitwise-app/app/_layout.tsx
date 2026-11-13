@@ -54,13 +54,10 @@ function RootLayoutContent() {
       <Stack.Screen name="manual-entry" />
       <Stack.Screen name="edit-profile" />
       <Stack.Screen name="scan-bill" />
-      <Stack.Screen name="select-expense-type" />
-      <Stack.Screen name="select-items" />
+      <Stack.Screen name="ocr-review" />
       <Stack.Screen name="split-summary" />
-      <Stack.Screen name="settlement" />
       <Stack.Screen name="add-group" />
       <Stack.Screen name="qr-code" />
-      <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
     </Stack>
   );
 }

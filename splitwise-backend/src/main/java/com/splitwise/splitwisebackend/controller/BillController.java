@@ -10,17 +10,20 @@ import com.splitwise.splitwisebackend.service.BillService;
 import com.splitwise.splitwisebackend.service.SplitCalculationService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.Collections;
 import java.util.List;
 
 @RestController
 @RequestMapping("/api/bills")
 @RequiredArgsConstructor
+@Slf4j
 public class BillController {
 
     private final BillService billService;
@@ -42,39 +45,39 @@ public class BillController {
     }
 
     @GetMapping("/group/{groupId}")
-    public ResponseEntity<List<Bill>> getBillsByGroup(@PathVariable String groupId) {
+    public ResponseEntity<List<Bill>> getBillsByGroup(@PathVariable("groupId") String groupId) {
         List<Bill> bills = billService.getBillsByGroup(groupId);
         return ResponseEntity.ok(bills);
     }
 
     @GetMapping("/with-friend/{friendId}")
-    public ResponseEntity<List<Bill>> getBillsWithFriend(@PathVariable String friendId) {
+    public ResponseEntity<List<Bill>> getBillsWithFriend(@PathVariable("friendId") String friendId) {
         String userId = getCurrentUserId();
         List<Bill> bills = billService.getBillsWithFriend(userId, friendId);
         return ResponseEntity.ok(bills);
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<Bill> getBill(@PathVariable String id) {
+    public ResponseEntity<Bill> getBill(@PathVariable("id") String id) {
         Bill bill = billService.getBillById(id);
         return ResponseEntity.ok(bill);
     }
 
     @GetMapping("/{id}/breakdown")
-    public ResponseEntity<BillBreakdownResponse> getBillBreakdown(@PathVariable String id) {
+    public ResponseEntity<BillBreakdownResponse> getBillBreakdown(@PathVariable("id") String id) {
         Bill bill = billService.getBillById(id);
         BillBreakdownResponse breakdown = splitCalculationService.calculateBillBreakdown(bill);
         return ResponseEntity.ok(breakdown);
     }
 
     @PutMapping("/{id}")
-    public ResponseEntity<Bill> updateBill(@PathVariable String id, @Valid @RequestBody CreateBillRequest request) {
+    public ResponseEntity<Bill> updateBill(@PathVariable("id") String id, @Valid @RequestBody CreateBillRequest request) {
         Bill bill = billService.updateBill(id, request);
         return ResponseEntity.ok(bill);
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Void> deleteBill(@PathVariable String id) {
+    public ResponseEntity<Void> deleteBill(@PathVariable("id") String id) {
         Bill bill = billService.getBillById(id);
         String currentUserId = getCurrentUserId();
         
@@ -87,9 +90,14 @@ public class BillController {
     }
 
     @GetMapping("/group/{groupId}/settlements")
-    public ResponseEntity<List<Settlement>> getSettlementsForGroup(@PathVariable String groupId) {
-        List<Settlement> settlements = splitCalculationService.getSettlementsForGroup(groupId);
-        return ResponseEntity.ok(settlements);
+    public ResponseEntity<List<Settlement>> getSettlementsForGroup(@PathVariable("groupId") String groupId) {
+        try {
+            List<Settlement> settlements = splitCalculationService.getSettlementsForGroup(groupId);
+            return ResponseEntity.ok(settlements);
+        } catch (Exception e) {
+            log.error("Error calculating settlements for group {}: ", groupId, e);
+            return ResponseEntity.ok(Collections.emptyList());
+        }
     }
 
     @GetMapping("/mine")
