@@ -5,7 +5,7 @@ import { router } from 'expo-router';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 15000,
+  timeout: 30000, // 30s timeout accommodates Render cold starts
 });
 
 // Request interceptor to attach JWT token and set Content-Type
@@ -51,18 +51,39 @@ apiClient.interceptors.response.use(
   async (error) => {
     const config = error.config;
 
-    // Handle network errors (request never reached the server) with retry
-    if (error.code === 'ERR_NETWORK' || error.message === 'Network Error') {
-      // Retry up to 2 more times (3 total attempts) with 1-second delay
+    // Detect network-level failures (no HTTP response received from server)
+    const isNetworkError =
+      !error.response ||
+      error.code === 'ERR_NETWORK' ||
+      error.message === 'Network Error' ||
+      error.code === 'ECONNABORTED' ||
+      error.code === 'ETIMEDOUT' ||
+      error.code === 'ECONNREFUSED';
+
+    if (isNetworkError && config) {
+      // Retry up to 2 times (3 total attempts) with 1-second delay
       const retryCount = config.__retryCount || 0;
       if (retryCount < 2) {
         config.__retryCount = retryCount + 1;
-        console.log(`Network error on attempt ${retryCount + 1}, retrying... (${config.url})`);
+        console.log(`[API] Retrying connection (attempt ${retryCount + 1}/3)... (${config.url || ''})`);
         await new Promise(resolve => setTimeout(resolve, 1000));
         return apiClient(config);
       }
-      console.error('Network error - cannot reach server after retries:', config?.url);
-      error.userMessage = "Can't reach the server - check that you're on the same WiFi and the backend is running";
+
+      // Safe logging (never logs passwords or tokens)
+      console.error('[API] Network error - server unreachable after retries:', {
+        url: config?.url,
+        code: error.code,
+        message: error.message,
+      });
+
+      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+        error.userMessage =
+          'Connection timed out. The server may be waking up (Render free tier spin-up). Please try again in a few moments.';
+      } else {
+        error.userMessage =
+          "Can't reach the server. Please check your internet connection and ensure the backend service is running.";
+      }
       return Promise.reject(error);
     }
 
@@ -85,8 +106,8 @@ apiClient.interceptors.response.use(
         import('react-native').then(({ DeviceEventEmitter }) => {
           DeviceEventEmitter.emit('auth:logout');
         });
-      } catch (error) {
-        console.error('Error clearing auth token:', error);
+      } catch (err) {
+        console.error('Error clearing auth token:', err);
       }
     }
     return Promise.reject(error);

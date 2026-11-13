@@ -96,13 +96,41 @@ export default function AuthScreen({ initialTab = 'signup' }: AuthScreenProps) {
       // On success, navigate to tabs
       router.replace('/(tabs)');
     } catch (err: any) {
-      // Extract error message from backend response.
-      // Backend returns {"error": "..."} (see GlobalExceptionHandler).
-      const errorMessage =
-        err?.response?.data?.error ||
-        err?.response?.data?.message ||
-        err?.userMessage ||
-        'An error occurred. Please try again.';
+      // Safe diagnostic logging (never log passwords or tokens)
+      console.warn('[AUTH] Authentication error occurred:', {
+        status: err?.response?.status,
+        code: err?.code,
+        message: err?.message,
+        userMessage: err?.userMessage,
+      });
+
+      let errorMessage = 'An error occurred. Please try again.';
+
+      if (err?.response) {
+        const status = err.response.status;
+        const serverError = err.response.data?.error;
+        const serverMessage = err.response.data?.message;
+
+        if (status === 401) {
+          errorMessage = 'Invalid email or password. Please verify your credentials.';
+        } else if (status === 409) {
+          errorMessage = 'An account with this email already exists. Please log in.';
+        } else if (status === 400 && err.response.data?.details) {
+          const firstDetail = Object.values(err.response.data.details)[0];
+          errorMessage = typeof firstDetail === 'string' ? firstDetail : 'Validation failed. Please check your inputs.';
+        } else if (serverError && typeof serverError === 'string' && serverError !== 'Internal Server Error') {
+          errorMessage = serverError;
+        } else if (serverMessage && typeof serverMessage === 'string') {
+          errorMessage = serverMessage;
+        } else if (status >= 500) {
+          errorMessage = `Server error (${status}). The backend service encountered an issue. Please try again later.`;
+        }
+      } else if (err?.userMessage) {
+        errorMessage = err.userMessage;
+      } else if (err?.message === 'Network Error' || err?.code === 'ERR_NETWORK') {
+        errorMessage = 'Unable to reach the server. Please check your internet connection.';
+      }
+
       setError(errorMessage);
     } finally {
       setIsLoading(false);
@@ -134,7 +162,7 @@ export default function AuthScreen({ initialTab = 'signup' }: AuthScreenProps) {
         {/* Hero Bottom Content */}
         <View style={styles.heroBottom}>
           <Text style={styles.stepLabel}>Step 1 of 1</Text>
-          <Text style={styles.heroHeading}>Let's get you{'\n'}splitting bills.</Text>
+          <Text style={styles.heroHeading}>{"Let's get you\nsplitting bills."}</Text>
         </View>
 
         {/* Zigzag Edge */}

@@ -782,7 +782,7 @@ You will see:
 | `CLOUDINARY_API_SECRET` | No | — | Cloudinary API secret |
 | `CLOUDINARY_FOLDER` | No | `SplitWise` | Folder name for stored images |
 | `TESSERACT_DATAPATH` | No | `tessdata` | Path to Tesseract traineddata directory |
-| `EXPO_PUBLIC_API_URL` | No | Auto-detected | Frontend base API URL (`http://<IP>:8080/api`) |
+| `EXPO_PUBLIC_API_URL` | No | Auto-detected / Render | Frontend base API URL (`http://<IP>:8080/api` for LAN or `https://splitwise-backend-jtzy.onrender.com/api` for production) |
 
 > [!CAUTION]
 > **Security Reminder**: Never commit real database credentials, JWT secrets, or Cloudinary API keys to source control. Always keep them in uncommitted environment variables or `application-local.properties` (which is excluded by `.gitignore`).
@@ -884,9 +884,18 @@ Configuration in `eas.json`:
 ```json
 {
   "build": {
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://splitwise-backend-jtzy.onrender.com/api"
+      }
+    },
     "production": {
       "autoIncrement": true,
       "environment": "production",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://splitwise-backend-jtzy.onrender.com/api"
+      },
       "android": {
         "buildType": "apk"
       }

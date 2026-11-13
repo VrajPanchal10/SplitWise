@@ -12,7 +12,8 @@
       "supportsTablet": true
     },
     "android": {
-        "package": "com.vrajpanchal.splitwise",
+      "package": "com.vrajpanchal.splitwise",
+      "usesCleartextTraffic": true,
       "adaptiveIcon": {
         "backgroundColor": "#ffffff",
         "foregroundImage": "./assets/images/icon.png"

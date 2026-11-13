@@ -1,2 +1,2 @@
 @echo off
-call .\mvnw.cmd test "-Dtest=MultiCurrencyTest,SplitCalculationServiceTest,ReceiptParserServiceTest"
+call .\mvnw.cmd test "-Dtest=AuthServiceTest,MultiCurrencyTest,SplitCalculationServiceTest,ReceiptParserServiceTest"

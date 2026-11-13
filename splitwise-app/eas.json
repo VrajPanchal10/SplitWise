@@ -9,11 +9,17 @@
       "distribution": "internal"
     },
     "preview": {
-      "distribution": "internal"
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://splitwise-backend-jtzy.onrender.com/api"
+      }
     },
     "production": {
       "autoIncrement": true,
       "environment": "production",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://splitwise-backend-jtzy.onrender.com/api"
+      },
       "android": {
         "buildType": "apk"
       }

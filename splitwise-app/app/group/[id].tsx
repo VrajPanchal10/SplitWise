@@ -573,7 +573,7 @@ export default function GroupDetailScreen() {
             </>
           ) : (
             <>
-              <Text style={styles.balanceLabel}>You're settled</Text>
+              <Text style={styles.balanceLabel}>{"You're settled"}</Text>
               <Text style={[styles.balanceAmount, { color: theme.colors.success }]}>
                 {formatMoney(0, 'INR', true)}
               </Text>

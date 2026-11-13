@@ -54,7 +54,7 @@ export default function AddBillScreen() {
           <View style={styles.optionInfo}>
             <Text style={styles.optionTitle}>Scan a Bill</Text>
             <Text style={styles.optionSubtitle}>
-              Snap a photo and we'll read the items for you
+              {"Snap a photo and we'll read the items for you"}
             </Text>
           </View>
         </TouchableOpacity>
